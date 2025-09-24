@@ -106,6 +106,7 @@ impl FeatureSet {
                 .is_active(&move_precompile_verification_to_svm::id()),
             stricter_abi_and_runtime_constraints: self
                 .is_active(&stricter_abi_and_runtime_constraints::id()),
+            account_data_direct_mapping: self.is_active(&account_data_direct_mapping::id()),
             enable_bpf_loader_set_authority_checked_ix: self
                 .is_active(&enable_bpf_loader_set_authority_checked_ix::id()),
             enable_loader_v4: self.is_active(&enable_loader_v4::id()),
@@ -754,6 +755,10 @@ pub mod stricter_abi_and_runtime_constraints {
     solana_pubkey::declare_id!("CxeBn9PVeeXbmjbNwLv6U4C6svNxnC4JX6mfkvgeMocM");
 }
 
+pub mod account_data_direct_mapping {
+    solana_pubkey::declare_id!("9s3RKimHWS44rJcJ9P1rwCmn2TvMqtZQBmz815ZUUHqJ");
+}
+
 pub mod add_set_tx_loaded_accounts_data_size_instruction {
     solana_pubkey::declare_id!("G6vbf1UBok8MWb8m25ex86aoQHeKTzDKzuZADHkShqm6");
 }
@@ -1363,6 +1368,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (raise_block_limits_to_100m::id(), "SIMD-0286: Raise block limit to 100M"),
         (raise_account_cu_limit::id(), "SIMD-0306: Raise account CU limit to 40% max"),
         (raise_cpi_nesting_limit_to_8::id(), "SIMD-0296: Raise CPI nesting limit from 4 to 8"),
+        (account_data_direct_mapping::id(), "SIMD-0330: Account data direct mapping"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()

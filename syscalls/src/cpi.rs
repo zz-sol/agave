@@ -134,6 +134,8 @@ impl<'a> CallerAccount<'a> {
         let stricter_abi_and_runtime_constraints = invoke_context
             .get_feature_set()
             .stricter_abi_and_runtime_constraints;
+        let account_data_direct_mapping =
+            invoke_context.get_feature_set().account_data_direct_mapping;
 
         if stricter_abi_and_runtime_constraints {
             check_account_info_pointer(
@@ -226,7 +228,7 @@ impl<'a> CallerAccount<'a> {
                 vm_data_addr,
                 data.len() as u64,
                 stricter_abi_and_runtime_constraints,
-                invoke_context.account_data_direct_mapping,
+                account_data_direct_mapping,
             )?;
             (serialized_data, vm_data_addr, ref_to_len_in_vm)
         };
@@ -253,6 +255,8 @@ impl<'a> CallerAccount<'a> {
         let stricter_abi_and_runtime_constraints = invoke_context
             .get_feature_set()
             .stricter_abi_and_runtime_constraints;
+        let account_data_direct_mapping =
+            invoke_context.get_feature_set().account_data_direct_mapping;
 
         if stricter_abi_and_runtime_constraints {
             check_account_info_pointer(
@@ -304,7 +308,7 @@ impl<'a> CallerAccount<'a> {
             account_info.data_addr,
             account_info.data_len,
             stricter_abi_and_runtime_constraints,
-            invoke_context.account_data_direct_mapping,
+            account_data_direct_mapping,
         )?;
 
         // we already have the host addr we want: &mut account_info.data_len.
@@ -801,6 +805,8 @@ where
     let stricter_abi_and_runtime_constraints = invoke_context
         .get_feature_set()
         .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping =
+        invoke_context.get_feature_set().account_data_direct_mapping;
 
     for (instruction_account_index, instruction_account) in
         next_instruction_accounts.iter().enumerate()
@@ -869,7 +875,7 @@ where
                 &caller_account,
                 callee_account,
                 stricter_abi_and_runtime_constraints,
-                invoke_context.account_data_direct_mapping,
+                account_data_direct_mapping,
             )?;
 
             accounts.push(TranslatedAccount {
@@ -1028,6 +1034,8 @@ fn cpi_common<S: SyscallInvokeSigned>(
     let stricter_abi_and_runtime_constraints = invoke_context
         .get_feature_set()
         .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping =
+        invoke_context.get_feature_set().account_data_direct_mapping;
 
     for translate_account in accounts.iter_mut() {
         let mut callee_account = instruction_context
@@ -1040,6 +1048,7 @@ fn cpi_common<S: SyscallInvokeSigned>(
                 &mut translate_account.caller_account,
                 &mut callee_account,
                 stricter_abi_and_runtime_constraints,
+                account_data_direct_mapping,
             )?;
         }
     }
@@ -1054,7 +1063,7 @@ fn cpi_common<S: SyscallInvokeSigned>(
                     check_aligned,
                     &translate_account.caller_account,
                     &mut callee_account,
-                    invoke_context.account_data_direct_mapping,
+                    account_data_direct_mapping,
                 )?;
             }
         }
@@ -1187,6 +1196,7 @@ fn update_caller_account(
     caller_account: &mut CallerAccount<'_>,
     callee_account: &mut BorrowedAccount<'_>,
     stricter_abi_and_runtime_constraints: bool,
+    account_data_direct_mapping: bool,
 ) -> Result<(), Error> {
     *caller_account.lamports = callee_account.get_lamports();
     *caller_account.owner = *callee_account.get_owner();
@@ -1218,7 +1228,7 @@ fn update_caller_account(
     if prev_len != post_len {
         // when stricter_abi_and_runtime_constraints is enabled we don't cache the serialized data in
         // caller_account.serialized_data. See CallerAccount::from_account_info.
-        if !(stricter_abi_and_runtime_constraints && invoke_context.account_data_direct_mapping) {
+        if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
             // If the account has been shrunk, we're going to zero the unused memory
             // *that was previously used*.
             if post_len < prev_len {
@@ -1234,7 +1244,7 @@ fn update_caller_account(
                 caller_account.vm_data_addr,
                 post_len as u64,
                 stricter_abi_and_runtime_constraints,
-                invoke_context.account_data_direct_mapping,
+                account_data_direct_mapping,
             )?;
         }
         // this is the len field in the AccountInfo::data slice
@@ -1251,7 +1261,7 @@ fn update_caller_account(
         *serialized_len_ptr = post_len as u64;
     }
 
-    if !(stricter_abi_and_runtime_constraints && invoke_context.account_data_direct_mapping) {
+    if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
         // Propagate changes in the callee up to the caller.
         let to_slice = &mut caller_account.serialized_data;
         let from_slice = callee_account
@@ -1523,6 +1533,7 @@ mod tests {
             true, // check_aligned
             &mut caller_account,
             &mut callee_account,
+            stricter_abi_and_runtime_constraints,
             stricter_abi_and_runtime_constraints,
         )
         .unwrap();
