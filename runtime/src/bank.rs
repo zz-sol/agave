@@ -1552,12 +1552,12 @@ impl Bank {
                 &upcoming_feature_set.runtime_features(),
                 &compute_budget,
                 false, /* deployment */
-                false, /* debugging_features */
+                std::env::var("ENABLE_VM_TRACING").is_ok(), /* debugging_features */
             )
             .unwrap();
             let program_runtime_environment_v2 = create_program_runtime_environment_v2(
                 &compute_budget,
-                false, /* debugging_features */
+                std::env::var("ENABLE_VM_TRACING").is_ok(), /* debugging_features */
             );
             let mut upcoming_environments = program_cache.environments.clone();
             let changed_program_runtime_v1 =
@@ -4147,7 +4147,7 @@ impl Bank {
                             .unwrap_or(ComputeBudget::new_with_defaults(simd_0296_active))
                             .to_budget(),
                         false, /* deployment */
-                        false, /* debugging_features */
+                        std::env::var("ENABLE_VM_TRACING").is_ok(), /* debugging_features */
                     )
                     .unwrap(),
                 )),
@@ -4156,7 +4156,7 @@ impl Bank {
                         .compute_budget()
                         .unwrap_or(ComputeBudget::new_with_defaults(simd_0296_active))
                         .to_budget(),
-                    false, /* debugging_features */
+                    std::env::var("ENABLE_VM_TRACING").is_ok(), /* debugging_features */
                 ))),
             );
     }

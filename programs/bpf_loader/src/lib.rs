@@ -3,6 +3,7 @@
 
 #[cfg(feature = "svm-internal")]
 use qualifier_attr::qualifiers;
+use solana_sbpf::static_analysis::Analysis;
 use {
     solana_bincode::limited_deserialize,
     solana_clock::Slot,
@@ -1510,6 +1511,11 @@ fn execute<'a, 'b: 'a>(
         vm.context_object_pointer.execute_time = Some(Measure::start("execute"));
         vm.registers[1] = ebpf::MM_INPUT_START;
         let (compute_units_consumed, result) = vm.execute_program(executable, !use_jit);
+        if std::env::var("ENABLE_VM_TRACING").is_ok() {
+            let analysis = Analysis::from_executable(executable).unwrap();
+            let trace_log = vm.context_object_pointer.syscall_context.last().unwrap().as_ref().unwrap().trace_log.clone();
+            analysis.disassemble_trace_log(&mut std::io::stdout(), &trace_log).unwrap();
+        }
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);
             memory_pool.put_heap(heap);
