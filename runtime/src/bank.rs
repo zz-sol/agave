@@ -197,7 +197,7 @@ struct VerifyAccountsHashConfig {
     run_in_background: bool,
 }
 
-mod accounts_lt_hash;
+pub mod accounts_lt_hash;
 mod address_lookup_table;
 pub mod bank_hash_details;
 mod builtin_programs;
@@ -894,7 +894,7 @@ pub struct Bank {
     ///
     /// Note: The initial state must be strictly from an ancestor,
     /// and not an intermediate state within this slot.
-    cache_for_accounts_lt_hash: DashMap<Pubkey, AccountsLtHashCacheValue, ahash::RandomState>,
+    pub cache_for_accounts_lt_hash: DashMap<Pubkey, AccountsLtHashCacheValue, ahash::RandomState>,
 
     /// Stats related to the accounts lt hash
     stats_for_accounts_lt_hash: AccountsLtHashStats,
