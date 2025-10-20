@@ -155,6 +155,7 @@ edition = "2021"
 
 [workspace.lints.rust]
 warnings = "deny"
+deprecated = "warn"
 
 [workspace.lints.rust.unexpected_cfgs]
 level = "warn"
