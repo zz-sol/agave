@@ -33,6 +33,7 @@ solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 [dev-dependencies]
 bytemuck = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 rand0-7 = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keccak-hasher = { workspace = true, features = ["sha3"] }
