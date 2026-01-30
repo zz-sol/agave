@@ -1056,6 +1056,10 @@ pub mod enable_secp256r1_precompile {
     solana_pubkey::declare_id!("srremy31J5Y25FrAApwVb9kZcfXbusYMMsvTK9aWv5q");
 }
 
+pub mod enable_falcon_precompile {
+    solana_pubkey::declare_id!("3ct33a8Xst8uiT4UpMgN9fTjt5Aah9GJMePURGLjpXzY");
+}
+
 pub mod accounts_lt_hash {
     solana_pubkey::declare_id!("LTHasHQX6661DaDD4S6A2TFi6QBuiwXKv66fB1obfHq");
 }
@@ -2064,6 +2068,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             enable_secp256r1_precompile::id(),
             "SIMD-0075: Enable secp256r1 precompile",
+        ),
+        (
+            enable_falcon_precompile::id(),
+            "SIMD-XXXX: Enable falcon512 precompile",
         ),
         (
             migrate_stake_program_to_core_bpf::id(),

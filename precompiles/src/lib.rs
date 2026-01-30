@@ -9,7 +9,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 use {
-    agave_feature_set::{enable_secp256r1_precompile, FeatureSet},
+    agave_feature_set::{enable_falcon_precompile, enable_secp256r1_precompile, FeatureSet},
     solana_message::compiled_instruction::CompiledInstruction,
     solana_precompile_error::PrecompileError,
     solana_pubkey::Pubkey,
@@ -17,6 +17,7 @@ use {
 };
 
 pub mod ed25519;
+pub mod falcon;
 pub mod secp256k1;
 pub mod secp256r1;
 
@@ -73,6 +74,11 @@ static PRECOMPILES: LazyLock<Vec<Precompile>> = LazyLock::new(|| {
             solana_sdk_ids::ed25519_program::id(),
             None, // always enabled
             ed25519::verify,
+        ),
+        Precompile::new(
+            solana_sdk_ids::falcon512_program::id(),
+            Some(enable_falcon_precompile::id()),
+            falcon::verify,
         ),
         Precompile::new(
             solana_sdk_ids::secp256r1_program::id(),
