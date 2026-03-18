@@ -19,7 +19,7 @@ use {
         iter::{Either, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     },
     solana_bls_signatures::{
-        BlsError,
+        BlsError, PreparedHashedMessage,
         pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
         signature::SignatureProjective,
     },
@@ -44,12 +44,9 @@ pub(super) struct VotePayload {
 }
 
 impl VotePayload {
-    fn verify(self) -> Option<Self> {
-        let Ok(payload) = wincode::serialize(&self.vote_message.vote) else {
-            return None;
-        };
+    fn verify_prepared(self, prepared_payload: &PreparedHashedMessage) -> Option<Self> {
         self.bls_pubkey
-            .verify_signature(&self.vote_message.signature, &payload)
+            .verify_signature_prepared(&self.vote_message.signature, prepared_payload)
             .is_ok()
             .then_some(self)
     }
@@ -233,17 +230,16 @@ fn verify_votes_optimistic(
         // if one unique payload, just verify the aggregate signature for the single payload
         // this requires (2 pairings)
         aggregate_pubkeys[0]
-            .verify_signature(&aggregate_signature, &distinct_payloads[0])
+            .verify_signature_prepared(&aggregate_signature, &distinct_payloads[0])
             .is_ok()
     } else {
         // if non-unique payload, we need to apply a pairing for each distinct message,
-        // which is done inside `par_verify_distinct_aggregated`.
-        let payload_slices: Vec<&[u8]> = distinct_payloads.iter().map(|p| p.as_slice()).collect();
+        // which is done inside `par_verify_distinct_aggregated_prepared`.
         thread_pool.install(|| {
-            SignatureProjective::par_verify_distinct_aggregated(
+            SignatureProjective::par_verify_distinct_aggregated_prepared(
                 &aggregate_pubkeys,
                 &aggregate_signature,
-                &payload_slices,
+                &distinct_payloads,
             )
             .is_ok()
         })
@@ -274,7 +270,7 @@ fn aggregate_signatures(votes: &[VotePayload]) -> Result<SignatureProjective, Bl
 fn aggregate_pubkeys_by_payload(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
-) -> (Vec<Vec<u8>>, Result<Vec<PubkeyProjective>, BlsError>) {
+) -> (Vec<PreparedHashedMessage>, Result<Vec<PubkeyProjective>, BlsError>) {
     debug_assert!(current_thread_index().is_some());
     let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkeyAffine>> = HashMap::new();
 
@@ -296,7 +292,7 @@ fn aggregate_pubkeys_by_payload(
                 // TODO(sam): https://github.com/anza-xyz/alpenglow/issues/708
                 // should improve public key aggregation drastically (more than 80%)
                 let pubkey = PubkeyProjective::par_aggregate(pubkeys.into_par_iter());
-                (vote, pubkey)
+                (PreparedHashedMessage::new(&vote), pubkey)
             })
         })
         .unzip();
@@ -315,10 +311,23 @@ fn verify_individual_votes(
     votes_to_verify: Vec<VotePayload>,
     thread_pool: &ThreadPool,
 ) -> (Vec<VotePayload>, Vec<Pubkey>) {
+    let prepared_payloads: HashMap<_, _> = votes_to_verify
+        .iter()
+        .filter_map(|vote| {
+            let signed_vote = vote.vote_message.vote;
+            wincode::serialize(&signed_vote)
+                .ok()
+                .map(|payload| (signed_vote, PreparedHashedMessage::new(&payload)))
+        })
+        .collect();
+
     thread_pool.install(|| {
         votes_to_verify.into_par_iter().partition_map(|vote| {
             let remote_pubkey = vote.remote_pubkey;
-            match vote.verify() {
+            match prepared_payloads
+                .get(&vote.vote_message.vote)
+                .and_then(|prepared_payload| vote.verify_prepared(prepared_payload))
+            {
                 Some(vote) => Either::Left(vote),
                 None => Either::Right(remote_pubkey),
             }

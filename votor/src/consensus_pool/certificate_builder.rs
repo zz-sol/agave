@@ -275,8 +275,9 @@ mod tests {
             vote::Vote,
         },
         solana_bls_signatures::{
-            Keypair as BLSKeypair, PubkeyProjective as BLSPubkeyProjective,
-            Signature as BLSSignature, SignatureProjective, VerifiablePubkey,
+            Keypair as BLSKeypair, PreparedHashedMessage,
+            PubkeyProjective as BLSPubkeyProjective, Signature as BLSSignature,
+            SignatureProjective, VerifiablePubkey,
         },
         solana_hash::Hash,
         solana_signer_store::{Decoded, decode},
@@ -483,9 +484,10 @@ mod tests {
         // 3. Verification: Aggregate the public keys and verify the signature.
         let aggregate_pubkey = BLSPubkeyProjective::aggregate(keypairs.iter().map(|kp| &kp.public))
             .expect("Failed to aggregate public keys");
+        let prepared_vote = PreparedHashedMessage::new(&serialized_vote);
 
         aggregate_pubkey
-            .verify_signature(&certificate_message.signature, &serialized_vote)
+            .verify_signature_prepared(&certificate_message.signature, &prepared_vote)
             .expect("BLS aggregate signature verification failed for base2 encoded certificate");
     }
 
@@ -500,8 +502,6 @@ mod tests {
         // 1. Setup: Create two groups of validators signing two different vote types.
         let mut all_vote_messages = Vec::new();
         let mut all_pubkeys = Vec::new();
-        let mut all_messages = Vec::new();
-
         // Group 1: Signs a Notarize vote.
         let notarize_vote = Vote::new_notarization_vote(slot, hash);
         let serialized_notarize_vote = bincode::serialize(&notarize_vote).unwrap();
@@ -514,7 +514,6 @@ mod tests {
                 rank: i as u16, // Ranks 0, 1, 2
             });
             all_pubkeys.push(keypair.public);
-            all_messages.push(serialized_notarize_vote.clone());
         }
 
         // Group 2: Signs a NotarizeFallback vote.
@@ -529,7 +528,6 @@ mod tests {
                 rank: i as u16, // Ranks 3, 4, 5
             });
             all_pubkeys.push(keypair.public);
-            all_messages.push(serialized_fallback_vote.clone());
         }
 
         // 2. Generation: Aggregate votes. Because there are two vote types, this will use
@@ -558,10 +556,17 @@ mod tests {
             }
         }
 
-        SignatureProjective::verify_distinct_aggregated(
+        let prepared_notarize_vote = PreparedHashedMessage::new(&serialized_notarize_vote);
+        let prepared_fallback_vote = PreparedHashedMessage::new(&serialized_fallback_vote);
+        let prepared_messages: Vec<_> = (0..3)
+            .map(|_| prepared_notarize_vote.clone())
+            .chain((0..3).map(|_| prepared_fallback_vote.clone()))
+            .collect();
+
+        SignatureProjective::verify_distinct_aggregated_prepared(
             all_pubkeys.iter(),
             &certificate_message.signature,
-            all_messages.iter().map(Vec::as_slice),
+            prepared_messages.iter(),
         )
         .unwrap();
     }

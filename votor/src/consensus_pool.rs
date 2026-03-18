@@ -678,8 +678,8 @@ mod tests {
         super::*,
         agave_votor_messages::consensus_message::{BLS_KEYPAIR_DERIVE_SEED, VoteMessage},
         solana_bls_signatures::{
-            Pubkey as BLSPubkey, Signature as BLSSignature, VerifiableSignature,
-            keypair::Keypair as BLSKeypair,
+            PreparedHashedMessage, Pubkey as BLSPubkey, Signature as BLSSignature,
+            VerifiablePubkey, keypair::Keypair as BLSKeypair,
         },
         solana_clock::Slot,
         solana_hash::Hash,
@@ -2355,11 +2355,11 @@ mod tests {
         let bls_pubkey: BLSPubkey = bls_keypair.public.into();
 
         let signed_message = bincode::serialize(&vote).unwrap();
+        let prepared_signed_message = PreparedHashedMessage::new(&signed_message);
 
         assert!(
-            vote_message
-                .signature
-                .verify(&bls_pubkey, &signed_message)
+            bls_pubkey
+                .verify_signature_prepared(&vote_message.signature, &prepared_signed_message)
                 .is_ok(),
             "BLS signature verification failed for VoteMessage"
         );
