@@ -253,20 +253,16 @@ fn verify_votes_optimistic(
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-fn aggregate_signatures(votes: &[VotePayload]) -> Result<SignatureAffine, BlsError> {
+fn aggregate_signatures(votes: &[VotePayload]) -> Result<SignatureProjective, BlsError> {
     debug_assert!(current_thread_index().is_some());
-    let signatures: Vec<_> = votes
-        .iter()
-        .map(|v| SignatureAffineUnchecked::try_from(&v.vote_message.signature))
-        .collect::<Result<Vec<_>, _>>()?;
+    let signatures = votes.par_iter().map(|v| &v.vote_message.signature);
     // TODO(sam): Currently, `par_aggregate` performs full validation
     // (on-curve + subgroup check) for every signature. Since the subgroup
     // check is expensive, we can use an `unchecked` deserialization here
     // (performing only the cheap on-curve check) and rely on a single subgroup
     // check on the final aggregated signature. This should save more than 80%
     // of the time for signature aggregation.
-    let aggregate_signature = SignatureProjective::par_aggregate(signatures.par_iter())?;
-    SignatureAffineUnchecked::from(aggregate_signature).verify_subgroup()
+    SignatureProjective::par_aggregate(signatures)
 }
 
 #[allow(clippy::type_complexity)]
