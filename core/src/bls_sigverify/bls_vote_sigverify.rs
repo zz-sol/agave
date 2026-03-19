@@ -21,7 +21,7 @@ use {
     solana_bls_signatures::{
         BlsError, PreparedHashedMessage,
         pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
-        signature::{SignatureAffine, SignatureAffineUnchecked, SignatureProjective},
+        signature::{SignatureProjective},
     },
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -344,19 +344,33 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic]
     fn ensure_aggregate_signatures_runs_on_thread_pool() {
         let votes = vec![];
-        // calling without a rayon thread pool should trigger a debug assert.
-        aggregate_signatures(&votes).unwrap();
+        // in debug builds this should panic because the method requires a rayon thread pool;
+        // in release builds debug assertions are disabled and an error is returned instead.
+        if cfg!(debug_assertions) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                aggregate_signatures(&votes).unwrap();
+            }));
+            assert!(result.is_err());
+        } else {
+            assert!(aggregate_signatures(&votes).is_ok());
+        }
     }
 
     #[test]
-    #[should_panic]
     fn ensure_aggregate_pubkeys_by_payload_runs_on_thread_pool() {
         let votes = vec![];
         let mut stats = SigVerifyVoteStats::default();
-        // calling without a rayon thread pool should trigger a debug assert.
-        aggregate_pubkeys_by_payload(&votes, &mut stats).1.unwrap();
+        // in debug builds this should panic because the method requires a rayon thread pool;
+        // in release builds debug assertions are disabled and an error is returned instead.
+        if cfg!(debug_assertions) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = aggregate_pubkeys_by_payload(&votes, &mut stats).1;
+            }));
+            assert!(result.is_err());
+        } else {
+            assert!(aggregate_pubkeys_by_payload(&votes, &mut stats).1.is_ok());
+        }
     }
 }

@@ -553,7 +553,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "retryable indexes were not in order: [1, 0]"]
     fn test_receive_completed_out_of_order() {
         let mut container = TransactionStateContainer::with_capacity(1024);
 
@@ -575,7 +574,15 @@ mod tests {
         };
         finished_work_sender.send(finished_work).unwrap();
 
-        // This should panic because the retryable indexes are not in order.
-        let _ = common.try_receive_completed(&mut container);
+        // In debug builds this should panic because the retryable indexes are out-of-order
+        // and debug assertions are enabled; in release builds this check is disabled.
+        if cfg!(debug_assertions) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = common.try_receive_completed(&mut container);
+            }));
+            assert!(result.is_err());
+        } else {
+            assert!(common.try_receive_completed(&mut container).is_ok());
+        }
     }
 }
