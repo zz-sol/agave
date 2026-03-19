@@ -20,8 +20,11 @@ use {
     },
     solana_bls_signatures::{
         BlsError, PreparedHashedMessage,
-        pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
-        signature::SignatureProjective,
+        pubkey::{
+            PubkeyAffine as BlsPubkeyAffine, PubkeyAffineUnchecked, PubkeyProjective,
+            VerifiablePubkey,
+        },
+        signature::{SignatureAffineUnchecked, SignatureProjective},
     },
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -226,6 +229,15 @@ fn verify_votes_optimistic(
         return false;
     };
 
+    let Ok(aggregate_pubkeys) = aggregate_pubkeys
+        .into_iter()
+        .map(PubkeyAffineUnchecked::from)
+        .map(|pubkey| pubkey.verify_subgroup())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+
     let verified = if distinct_payloads.len() == 1 {
         // if one unique payload, just verify the aggregate signature for the single payload
         // this requires (2 pairings)
@@ -255,14 +267,20 @@ fn verify_votes_optimistic(
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn aggregate_signatures(votes: &[VotePayload]) -> Result<SignatureProjective, BlsError> {
     debug_assert!(current_thread_index().is_some());
-    let signatures = votes.par_iter().map(|v| &v.vote_message.signature);
+    let signatures: Vec<_> = votes
+        .iter()
+        .map(|v| SignatureAffineUnchecked::try_from(&v.vote_message.signature))
+        .collect::<Result<Vec<_>, _>>()?;
     // TODO(sam): Currently, `par_aggregate` performs full validation
     // (on-curve + subgroup check) for every signature. Since the subgroup
     // check is expensive, we can use an `unchecked` deserialization here
     // (performing only the cheap on-curve check) and rely on a single subgroup
     // check on the final aggregated signature. This should save more than 80%
     // of the time for signature aggregation.
-    SignatureProjective::par_aggregate(signatures)
+    let aggregate_signature = SignatureProjective::par_aggregate(signatures.par_iter())?;
+    SignatureAffineUnchecked::from(aggregate_signature)
+        .verify_subgroup()
+        .map(Into::into)
 }
 
 #[allow(clippy::type_complexity)]
@@ -270,7 +288,10 @@ fn aggregate_signatures(votes: &[VotePayload]) -> Result<SignatureProjective, Bl
 fn aggregate_pubkeys_by_payload(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
-) -> (Vec<PreparedHashedMessage>, Result<Vec<PubkeyProjective>, BlsError>) {
+) -> (
+    Vec<PreparedHashedMessage>,
+    Result<Vec<PubkeyProjective>, BlsError>,
+) {
     debug_assert!(current_thread_index().is_some());
     let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkeyAffine>> = HashMap::new();
 
