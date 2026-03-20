@@ -275,9 +275,8 @@ mod tests {
             vote::Vote,
         },
         solana_bls_signatures::{
-            Keypair as BLSKeypair, PreparedHashedMessage,
-            PubkeyProjective as BLSPubkeyProjective, Signature as BLSSignature,
-            SignatureProjective, VerifiablePubkey,
+            Keypair as BLSKeypair, PreparedHashedMessage, PubkeyProjective as BLSPubkeyProjective,
+            Signature as BLSSignature, SignatureProjective, VerifiablePubkey,
         },
         solana_hash::Hash,
         solana_signer_store::{Decoded, decode},
