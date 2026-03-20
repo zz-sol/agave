@@ -8302,6 +8302,7 @@ dependencies = [
  "serde_derive",
  "solana-frozen-abi",
  "solana-frozen-abi-macro",
+ "wincode",
 ]
 
 [[package]]
@@ -9134,6 +9135,7 @@ dependencies = [
  "solana-hash 4.2.0",
  "solana-pubkey 4.1.0",
  "solana-sha256-hasher",
+ "wincode",
 ]
 
 [[package]]
@@ -9146,6 +9148,7 @@ dependencies = [
  "solana-hash 4.2.0",
  "solana-nonce",
  "solana-sdk-ids",
+ "wincode",
 ]
 
 [[package]]
@@ -11189,6 +11192,7 @@ dependencies = [
  "assert_matches",
  "bencher",
  "bs58",
+ "bytes",
  "crossbeam-channel",
  "itertools 0.14.0",
  "lazy-lru",
