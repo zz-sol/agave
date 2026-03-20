@@ -206,7 +206,7 @@ fn verify_base3_prepared(
             );
 
             let pubkeys = [primary_agg_res?, fallback_agg_res?];
-            // TODO: The Prepared types are ~19kb, so this is a very heavy clone. 
+            // TODO: The Prepared types are ~19kb, so this is a very heavy clone.
             // Update the API so we can pass the reference
             let payloads = [payload.clone(), fallback_payload.clone()];
 
