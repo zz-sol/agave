@@ -2040,9 +2040,8 @@ mod tests {
         let signed_message = bincode::serialize(&vote).unwrap();
         let prepared_signed_message = PreparedHashedMessage::new(&signed_message);
 
-        vote_message
-            .signature
-            .verify(&bls_pubkey, &signed_message)
+        bls_pubkey
+            .verify_signature_prepared(&vote_message.signature, &prepared_signed_message)
             .unwrap();
     }
 

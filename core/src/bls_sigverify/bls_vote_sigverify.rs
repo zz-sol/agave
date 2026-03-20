@@ -21,7 +21,7 @@ use {
     solana_bls_signatures::{
         BlsError, PreparedHashedMessage,
         pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
-        signature::{SignatureProjective},
+        signature::SignatureProjective,
     },
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
