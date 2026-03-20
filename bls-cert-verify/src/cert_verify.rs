@@ -141,7 +141,13 @@ pub fn verify_base2<S: AsSignatureAffine>(
     rank_map: impl FnMut(usize) -> Option<BlsPubkeyAffine>,
 ) -> Result<(), Error> {
     let prepared_payload = PreparedHashedMessage::new(payload);
-    verify_base2_prepared(&prepared_payload, signature, ranks, max_validators, rank_map)
+    verify_base2_prepared(
+        &prepared_payload,
+        signature,
+        ranks,
+        max_validators,
+        rank_map,
+    )
 }
 
 fn verify_base2_prepared<S: AsSignatureAffine>(
@@ -200,13 +206,15 @@ fn verify_base3_prepared(
             );
 
             let pubkeys = [primary_agg_res?, fallback_agg_res?];
+            // TODO: The Prepared types are ~19kb, so this is a very heavy clone. 
+            // Update the API so we can pass the reference
             let payloads = [payload.clone(), fallback_payload.clone()];
 
-            Ok(SignatureProjective::par_verify_distinct_aggregated_prepared(
-                &pubkeys,
-                signature,
-                &payloads,
-            )?)
+            Ok(
+                SignatureProjective::par_verify_distinct_aggregated_prepared(
+                    &pubkeys, signature, &payloads,
+                )?,
+            )
         }
     }
 }
