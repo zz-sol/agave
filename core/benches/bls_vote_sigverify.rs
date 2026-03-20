@@ -102,7 +102,7 @@ fn precompute_prepared_payloads(votes: &[VotePayload]) -> HashMap<Vote, Prepared
         .iter()
         .fold(HashMap::with_capacity(votes.len()), |mut acc, vote| {
             acc.entry(vote.vote_message.vote).or_insert_with(|| {
-                let payload = bincode::serialize(&vote.vote_message.vote).unwrap();
+                let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
                 PreparedHashedMessage::new(&payload)
             });
             acc
@@ -128,7 +128,7 @@ fn verify_votes_optimistic_with_prepared_payloads(
                     .push(&vote.bls_pubkey);
 
                 if !use_cached_payloads {
-                    let payload = bincode::serialize(&vote.vote_message.vote).unwrap();
+                    let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
                     let prepared_payload = PreparedHashedMessage::new(&payload);
                     inline_prepared_payloads
                         .entry(&vote.vote_message.vote)
