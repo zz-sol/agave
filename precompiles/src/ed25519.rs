@@ -1,6 +1,6 @@
 use {
     agave_feature_set::FeatureSet,
-    ed25519_dalek::{Signature, VerificationKey},
+    ed25519_heea::{Signature, VerificationKey},
     solana_ed25519_program::{
         Ed25519SignatureOffsets, PUBKEY_SERIALIZED_SIZE, SIGNATURE_OFFSETS_SERIALIZED_SIZE,
         SIGNATURE_OFFSETS_START, SIGNATURE_SERIALIZED_SIZE,
@@ -110,7 +110,7 @@ pub mod tests {
         super::*,
         crate::test_verify_with_alignment,
         bytemuck::bytes_of,
-        ed25519_dalek::SigningKey,
+        ed25519_heea::SigningKey,
         hex,
         rand::Rng,
         solana_ed25519_program::{
@@ -452,7 +452,7 @@ pub mod tests {
     fn test_ed25519_malleability() {
         agave_logger::setup();
 
-        // sig created via ed25519_dalek: both pass
+        // sig created via ed25519-heea: both pass
         let secret_bytes: [u8; 32] = rand::random();
         let privkey = SigningKey::from_bytes(&secret_bytes);
         let message_arr = b"hello";

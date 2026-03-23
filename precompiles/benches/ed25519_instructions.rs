@@ -2,7 +2,7 @@
 
 extern crate test;
 use {
-    agave_feature_set::FeatureSet, agave_precompiles::ed25519::verify, ed25519_dalek::SigningKey,
+    agave_feature_set::FeatureSet, agave_precompiles::ed25519::verify, ed25519_heea::SigningKey,
     rand::Rng, solana_ed25519_program::new_ed25519_instruction_with_signature,
     solana_instruction::Instruction, test::Bencher,
 };
