@@ -8,8 +8,8 @@ use {
     criterion::{BatchSize, Criterion, criterion_group, criterion_main},
     rayon::{ThreadPool, ThreadPoolBuilder, iter::IntoParallelIterator},
     solana_bls_signatures::{
-        Keypair as BLSKeypair, PreparedHashedMessage, Pubkey as BLSPubkey, VerifiablePubkey,
-        pubkey::PubkeyProjective, signature::SignatureProjective,
+        HashedMessage, Keypair as BLSKeypair, PreparedHashedMessage, Pubkey as BLSPubkey,
+        VerifiablePubkey, pubkey::PubkeyProjective, signature::SignatureProjective,
     },
     solana_core::bls_sigverify::{
         bls_vote_sigverify::{
@@ -115,48 +115,50 @@ fn verify_votes_optimistic_with_prepared_payloads(
     thread_pool: &ThreadPool,
 ) -> bool {
     let use_cached_payloads = prepared_payloads.is_some();
-    let (signature_result, (distinct_payloads, aggregate_pubkeys)) = thread_pool.join(
-        || aggregate_signatures(votes),
-        || {
-            let mut grouped_votes: HashMap<&Vote, Vec<_>> = HashMap::new();
-            let mut inline_prepared_payloads: HashMap<&Vote, PreparedHashedMessage> =
-                HashMap::new();
-            for vote in votes {
-                grouped_votes
-                    .entry(&vote.vote_message.vote)
-                    .or_default()
-                    .push(&vote.bls_pubkey);
-
-                if !use_cached_payloads {
-                    let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
-                    let prepared_payload = PreparedHashedMessage::new(&payload);
-                    inline_prepared_payloads
+    let (signature_result, (is_single_payload, distinct_payloads, aggregate_pubkeys)) = thread_pool
+        .join(
+            || aggregate_signatures(votes),
+            || {
+                let mut grouped_votes: HashMap<&Vote, Vec<_>> = HashMap::new();
+                let mut inline_hashed_payloads: HashMap<&Vote, HashedMessage> = HashMap::new();
+                for vote in votes {
+                    grouped_votes
                         .entry(&vote.vote_message.vote)
-                        .or_insert(prepared_payload);
-                }
-            }
+                        .or_default()
+                        .push(&vote.bls_pubkey);
 
-            let mut grouped_payloads = Vec::with_capacity(grouped_votes.len());
-            let mut grouped_pubkeys = Vec::with_capacity(grouped_votes.len());
-            for (vote, pubkeys) in grouped_votes {
-                let prepared_payload = match prepared_payloads {
-                    Some(payloads) => payloads
-                        .get(vote)
-                        .expect("precomputed payload should exist for all votes")
-                        .clone(),
-                    None => inline_prepared_payloads
-                        .remove(vote)
-                        .expect("prepared payload should be computed inline"),
-                };
-                grouped_payloads.push(prepared_payload);
-                grouped_pubkeys.push(
-                    PubkeyProjective::par_aggregate(pubkeys.into_par_iter())
-                        .expect("pubkey aggregation should succeed"),
-                );
-            }
-            (grouped_payloads, grouped_pubkeys)
-        },
-    );
+                    if !use_cached_payloads {
+                        let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
+                        let hashed_payload = HashedMessage::new(&payload);
+                        inline_hashed_payloads
+                            .entry(&vote.vote_message.vote)
+                            .or_insert(hashed_payload);
+                    }
+                }
+
+                let is_single_payload = grouped_votes.len() == 1;
+                let mut grouped_payloads: Vec<HashedMessage> =
+                    Vec::with_capacity(grouped_votes.len());
+                let mut grouped_pubkeys = Vec::with_capacity(grouped_votes.len());
+                for (vote, pubkeys) in grouped_votes {
+                    let hashed_payload = match prepared_payloads {
+                        Some(_) => {
+                            let payload = wincode::serialize(vote).unwrap();
+                            HashedMessage::new(&payload)
+                        }
+                        None => inline_hashed_payloads
+                            .remove(vote)
+                            .expect("hashed payload should be computed inline"),
+                    };
+                    grouped_payloads.push(hashed_payload);
+                    grouped_pubkeys.push(
+                        PubkeyProjective::par_aggregate(pubkeys.into_par_iter())
+                            .expect("pubkey aggregation should succeed"),
+                    );
+                }
+                (is_single_payload, grouped_payloads, grouped_pubkeys)
+            },
+        );
 
     let Ok(aggregate_signature) = signature_result else {
         return false;
@@ -166,12 +168,26 @@ fn verify_votes_optimistic_with_prepared_payloads(
         return false;
     }
 
-    if aggregate_pubkeys.len() == 1 {
+    if is_single_payload {
+        let prepared_payload = match prepared_payloads {
+            Some(payloads) => payloads
+                .get(&votes[0].vote_message.vote)
+                .expect("precomputed payload should exist for all votes"),
+            None => {
+                let payload = wincode::serialize(&votes[0].vote_message.vote).unwrap();
+                return aggregate_pubkeys[0]
+                    .verify_signature_prepared(
+                        &aggregate_signature,
+                        &PreparedHashedMessage::new(&payload),
+                    )
+                    .is_ok();
+            }
+        };
         aggregate_pubkeys[0]
-            .verify_signature_prepared(&aggregate_signature, &distinct_payloads[0])
+            .verify_signature_prepared(&aggregate_signature, prepared_payload)
             .is_ok()
     } else {
-        SignatureProjective::par_verify_distinct_aggregated_prepared(
+        SignatureProjective::par_verify_distinct_aggregated_pre_hashed(
             &aggregate_pubkeys,
             &aggregate_signature,
             &distinct_payloads,
