@@ -11,6 +11,7 @@ use {
     agave_votor::{
         consensus_metrics::ConsensusMetricsEventSender,
         consensus_rewards::{self},
+        generated_cert_types::GeneratedCertTypes,
     },
     agave_votor_messages::{
         consensus_message::{CertificateType, ConsensusMessage, VoteMessage},
@@ -56,6 +57,7 @@ pub(crate) struct SigVerifierContext {
     pub(crate) cluster_info: Arc<ClusterInfo>,
     pub(crate) leader_schedule: Arc<LeaderScheduleCache>,
     pub(crate) num_threads: usize,
+    pub(crate) generated_cert_types: Arc<GeneratedCertTypes>,
 }
 
 pub(crate) struct SigVerifierChannels {
@@ -95,6 +97,7 @@ struct SigVerifier {
     leader_schedule: Arc<LeaderScheduleCache>,
     /// thread pool to use for all parallel tasks
     thread_pool: ThreadPool,
+    generated_cert_types: Arc<GeneratedCertTypes>,
 }
 
 impl SigVerifier {
@@ -106,23 +109,26 @@ impl SigVerifier {
             cluster_info,
             leader_schedule,
             num_threads,
+            generated_cert_types,
         } = context;
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("solSigVerBLS{i:02}"))
             .build()
             .unwrap();
+        let root_slot = sharable_banks.root().slot();
         Self {
             migration_status,
             banlist,
             channels,
             sharable_banks,
-            stats: SigVerifierStats::default(),
+            stats: SigVerifierStats::new(root_slot),
             verified_certs: HashSet::new(),
             last_checked_root_slot: 0,
             cluster_info,
             leader_schedule,
             thread_pool,
+            generated_cert_types,
         }
     }
 
@@ -145,9 +151,9 @@ impl SigVerifier {
                 error!("verify_and_send_batch() failed with {e}. Exiting.");
                 break;
             }
-            self.stats.maybe_report();
+            self.stats.maybe_report(self.sharable_banks.root().slot());
         }
-        self.stats.do_report();
+        self.stats.do_report(self.sharable_banks.root().slot());
     }
 
     fn verify_and_send_batches(&mut self, batches: Vec<PacketBatch>) -> Result<(), SigVerifyError> {
@@ -155,7 +161,7 @@ impl SigVerifier {
         self.maybe_prune_caches(root_bank.slot());
 
         let ((certs_to_verify, votes_to_verify), extract_msgs_us) =
-            measure_us!(self.extract_and_filter_msgs(batches, &root_bank,));
+            measure_us!(self.extract_and_filter_msgs(batches, &root_bank));
         self.stats
             .extract_filter_msgs_us
             .add_sample(extract_msgs_us);
@@ -241,6 +247,10 @@ impl SigVerifier {
                     }
                     if self.verified_certs.contains(&cert.cert_type) {
                         self.stats.num_verified_certs_received += 1;
+                        continue;
+                    }
+                    if self.generated_cert_types.has_cert(&cert.cert_type) {
+                        self.stats.num_generated_certs_received += 1;
                         continue;
                     }
                     certs.push(CertPayload {
@@ -334,6 +344,7 @@ mod tests {
         bitvec::prelude::{BitVec, Lsb0},
         crossbeam_channel::{Receiver, TryRecvError},
         solana_bls_signatures::{Signature, Signature as BLSSignature},
+        solana_epoch_schedule::EpochSchedule,
         solana_gossip::contact_info::ContactInfo,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -366,6 +377,7 @@ mod tests {
         _reward_receiver: Receiver<AddVoteMessage>,
         pool_receiver: Receiver<Vec<ConsensusMessage>>,
         _metrics_receiver: ConsensusMetricsEventReceiver,
+        generated_cert_types: Arc<GeneratedCertTypes>,
     }
 
     impl TestContext {
@@ -385,13 +397,14 @@ mod tests {
             let stakes_vec = (0..validator_keypairs.len())
                 .map(|i| 1_000 - i as u64)
                 .collect::<Vec<_>>();
-            let genesis = create_genesis_config_with_alpenglow_vote_accounts(
+            let mut genesis = create_genesis_config_with_alpenglow_vote_accounts(
                 1_000_000_000,
                 &validator_keypairs,
                 stakes_vec,
             );
-            let bank0 = Bank::new_for_tests(&genesis.genesis_config);
-            let bank_forks = BankForks::new_rw_arc(bank0);
+            genesis.genesis_config.epoch_schedule = EpochSchedule::without_warmup();
+            let bank = Bank::new_for_tests(&genesis.genesis_config);
+            let bank_forks = BankForks::new_rw_arc(bank);
             let sharable_banks = bank_forks.read().unwrap().sharable_banks();
             let keypair = Keypair::new();
             let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
@@ -408,6 +421,7 @@ mod tests {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
             let (channel_to_metrics, metrics_receiver) = crossbeam_channel::unbounded();
 
+            let generated_cert_types = Arc::new(GeneratedCertTypes::default());
             let banlist = new_test_banlist();
             let verifier = SigVerifier::new(
                 SigVerifierContext {
@@ -417,6 +431,7 @@ mod tests {
                     cluster_info,
                     leader_schedule,
                     num_threads: 4,
+                    generated_cert_types: generated_cert_types.clone(),
                 },
                 SigVerifierChannels {
                     packet_receiver,
@@ -435,6 +450,7 @@ mod tests {
                 _reward_receiver: reward_receiver,
                 pool_receiver,
                 _metrics_receiver: metrics_receiver,
+                generated_cert_types,
             }
         }
     }
@@ -530,7 +546,7 @@ mod tests {
             vote_rank2,
         );
         let messages2 = vec![ConsensusMessage::Vote(vote_message2)];
-        ctx.verifier.stats = SigVerifierStats::default();
+        ctx.verifier.stats = SigVerifierStats::new(ctx.verifier.sharable_banks.root().slot());
         ctx.verifier
             .verify_and_send_batches(messages_to_batches(&messages2))
             .unwrap();
@@ -554,7 +570,7 @@ mod tests {
             vote_rank3,
         );
         let messages3 = vec![ConsensusMessage::Vote(vote_message3)];
-        ctx.verifier.stats = SigVerifierStats::default();
+        ctx.verifier.stats = SigVerifierStats::new(ctx.verifier.sharable_banks.root().slot());
         ctx.verifier
             .verify_and_send_batches(messages_to_batches(&messages3))
             .unwrap();
@@ -1273,6 +1289,7 @@ mod tests {
                 cluster_info,
                 leader_schedule,
                 num_threads: 4,
+                generated_cert_types: Arc::new(GeneratedCertTypes::default()),
             },
             SigVerifierChannels {
                 packet_receiver,
@@ -1363,7 +1380,7 @@ mod tests {
         let consensus_message2 = ConsensusMessage::Certificate(cert2);
         let packet_batches2 = messages_to_batches(&[consensus_message2]);
 
-        ctx.verifier.stats = SigVerifierStats::default();
+        ctx.verifier.stats = SigVerifierStats::new(ctx.verifier.sharable_banks.root().slot());
         ctx.verifier
             .verify_and_send_batches(packet_batches2)
             .unwrap();
@@ -1488,6 +1505,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn generated_certs_are_filtered() {
+        let mut ctx = TestContext::new();
+        let slot = 1235;
+        let cert_type = CertificateType::Skip(slot);
+        ctx.generated_cert_types.insert_cert(cert_type);
+        let cert = create_signed_certificate_message(
+            &ctx.validator_keypairs,
+            cert_type,
+            &(0..ctx.validator_keypairs.len()).collect::<Vec<usize>>(),
+        );
+        let consensus_message = ConsensusMessage::Certificate(cert);
+        let packet_batches = messages_to_batches(&[consensus_message]);
+        ctx.verifier
+            .verify_and_send_batches(packet_batches)
+            .unwrap();
+        assert_eq!(ctx.verifier.stats.num_generated_certs_received, 1);
+    }
+
+    #[test]
+    fn msgs_too_far_in_future_are_dropped() {
+        let mut ctx = TestContext::new();
+        let slot = ctx.verifier.sharable_banks.root().slot() + NUM_SLOTS_FOR_VERIFY + 1;
+        let cert_type = CertificateType::Skip(slot);
+        let cert = create_signed_certificate_message(
+            &ctx.validator_keypairs,
+            cert_type,
+            &(0..ctx.validator_keypairs.len()).collect::<Vec<usize>>(),
+        );
+        let cert = ConsensusMessage::Certificate(cert);
+        let vote = ConsensusMessage::Vote(create_signed_vote_message(
+            &ctx.validator_keypairs,
+            Vote::new_skip_vote(slot),
+            0,
+        ));
+        let packet_batches = messages_to_batches(&[cert, vote]);
+        ctx.verifier
+            .verify_and_send_batches(packet_batches)
+            .unwrap();
+        assert_eq!(ctx.verifier.stats.cert_stats.too_far_in_future, 1);
+        assert_eq!(ctx.verifier.stats.vote_stats.too_far_in_future, 1);
     }
 
     fn messages_to_batches(messages: &[ConsensusMessage]) -> Vec<PacketBatch> {

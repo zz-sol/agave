@@ -284,7 +284,7 @@ impl<'a> SnapshotMinimizer<'a> {
                 if self.minimized_account_set.contains(account.pubkey()) {
                     chunk_bytes += account.stored_size();
                     keep_accounts.push(account);
-                } else if self.accounts_db().accounts_index.contains(account.pubkey()) {
+                } else if self.accounts_db().contains(account.pubkey()) {
                     purge_pubkeys.push(account.pubkey());
                 }
             });
@@ -365,6 +365,7 @@ mod tests {
         solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
         solana_accounts_db::accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
         solana_genesis_config::create_genesis_config,
+        solana_hash::Hash,
         solana_loader_v3_interface::state::UpgradeableLoaderState,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_pubkey::Pubkey,
@@ -621,6 +622,7 @@ mod tests {
         )
         .unwrap();
         bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
         bank.squash();
         bank.force_flush_accounts_cache();
 
