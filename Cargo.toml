@@ -264,7 +264,7 @@ dirs-next = "2.0.0"
 dlopen2 = "0.8.2"
 dyn-clone = "1.0.20"
 eager = "0.1.0"
-ed25519-dalek = "=1.0.1"
+ed25519-dalek = { package = "ed25519-heea", git = "https://github.com/anza-xyz/cryptography", rev = "e56e48a4730fba9d2ee3babe1cd28613eda74aa7" }
 enum-iterator = "2.3.0"
 env_logger = "0.11.9"
 fast-math = "0.1"
