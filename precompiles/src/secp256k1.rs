@@ -101,6 +101,8 @@ pub fn verify(
     Ok(())
 }
 
+// Recovers a public key with `libsecp256k1`, which accepts high-S signatures.
+// This is a legacy method as the `libsecp256k1` crate is no longer maintained.
 fn recover_pubkey_legacy(
     message_hash: &[u8; 32],
     recovery_id: u8,
@@ -177,6 +179,8 @@ pub mod tests {
         },
     };
 
+    // Unit test.
+    // Remove this test when the legacy libsecp256k1 recovery path is deleted.
     #[test]
     fn test_recovery_backend_behavior_delta() {
         let secret_key = libsecp256k1::SecretKey::random(&mut thread_rng());
@@ -442,6 +446,79 @@ pub mod tests {
         .is_err());
     }
 
+    // Signatures are malleable.
+    #[test]
+    fn test_malleability() {
+        agave_logger::setup();
+
+        let secret_key = libsecp256k1::SecretKey::random(&mut thread_rng());
+        let public_key = libsecp256k1::PublicKey::from_secret_key(&secret_key);
+        let eth_address = eth_address_from_pubkey(&public_key.serialize()[1..].try_into().unwrap());
+
+        let message = b"hello";
+        let message_hash = {
+            let mut hasher = keccak::Hasher::default();
+            hasher.hash(message);
+            hasher.result()
+        };
+
+        let secp_message = libsecp256k1::Message::parse(message_hash.as_bytes());
+        let (signature, recovery_id) = libsecp256k1::sign(&secp_message, &secret_key);
+
+        // Flip the S value in the signature to make a different but valid signature.
+        let mut alt_signature = signature;
+        alt_signature.s = -alt_signature.s;
+        let alt_recovery_id = libsecp256k1::RecoveryId::parse(recovery_id.serialize() ^ 1).unwrap();
+
+        let mut data: Vec<u8> = vec![];
+        let mut both_offsets = vec![];
+
+        // Verify both signatures of the same message.
+        let sigs = [(signature, recovery_id), (alt_signature, alt_recovery_id)];
+        for (signature, recovery_id) in sigs.iter() {
+            let signature_offset = data.len();
+            data.extend(signature.serialize());
+            data.push(recovery_id.serialize());
+            let eth_address_offset = data.len();
+            data.extend(eth_address);
+            let message_data_offset = data.len();
+            data.extend(message);
+
+            let data_start = 1 + SIGNATURE_OFFSETS_SERIALIZED_SIZE * 2;
+
+            let offsets = SecpSignatureOffsets {
+                signature_offset: (signature_offset + data_start) as u16,
+                signature_instruction_index: 0,
+                eth_address_offset: (eth_address_offset + data_start) as u16,
+                eth_address_instruction_index: 0,
+                message_data_offset: (message_data_offset + data_start) as u16,
+                message_data_size: message.len() as u16,
+                message_instruction_index: 0,
+            };
+
+            both_offsets.push(offsets);
+        }
+
+        let mut instruction_data: Vec<u8> = vec![2];
+
+        for offsets in both_offsets {
+            let offsets = bincode::serialize(&offsets).unwrap();
+            instruction_data.extend(offsets);
+        }
+
+        instruction_data.extend(data);
+
+        test_verify_with_alignment(
+            verify,
+            &instruction_data,
+            &[&instruction_data],
+            &FeatureSet::all_enabled(),
+        )
+        .unwrap();
+    }
+
+    // Integration test.
+    // Remove this test when the legacy libsecp256k1 recovery path is deleted.
     #[test]
     fn test_high_s_malleability_parity_with_and_without_k256_feature() {
         agave_logger::setup();
