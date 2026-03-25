@@ -119,6 +119,11 @@ fn recover_pubkey_legacy(
     Ok(pubkey.serialize()[1..65].try_into().unwrap())
 }
 
+/// Recovers a public key with `k256` while preserving legacy high-S acceptance.
+///
+/// `k256` recovery requires low-S signatures. To match `libsecp256k1`
+/// semantics for malleable signatures, this normalizes high-S signatures to
+/// low-S and flips the recovery-id y-parity when normalization occurs.
 fn recover_pubkey_k256(
     message_hash: &[u8; 32],
     recovery_id: u8,
@@ -244,7 +249,7 @@ pub mod tests {
         instruction_data[0] = num_signatures;
         let writer = std::io::Cursor::new(&mut instruction_data[1..]);
         bincode::serialize_into(writer, &offsets).unwrap();
-        let feature_set = FeatureSet::default();
+        let feature_set = FeatureSet::all_enabled();
         test_verify_with_alignment(verify, &instruction_data, &[&[0u8; 100]], &feature_set)
     }
 
@@ -258,7 +263,7 @@ pub mod tests {
         let writer = std::io::Cursor::new(&mut instruction_data[1..]);
         bincode::serialize_into(writer, &offsets).unwrap();
         instruction_data.truncate(instruction_data.len() - 1);
-        let feature_set = FeatureSet::default();
+        let feature_set = FeatureSet::all_enabled();
 
         assert_eq!(
             test_verify_with_alignment(verify, &instruction_data, &[&[0u8; 100]], &feature_set),
@@ -387,7 +392,7 @@ pub mod tests {
         instruction_data[0] = 0;
         let writer = std::io::Cursor::new(&mut instruction_data[1..]);
         bincode::serialize_into(writer, &offsets).unwrap();
-        let feature_set = FeatureSet::default();
+        let feature_set = FeatureSet::all_enabled();
 
         assert_eq!(
             test_verify_with_alignment(verify, &instruction_data, &[&[0u8; 100]], &feature_set),
@@ -484,8 +489,7 @@ pub mod tests {
         instruction_data.extend(data);
 
         let legacy_feature_set = FeatureSet::default();
-        let mut k256_feature_set = FeatureSet::all_enabled();
-        k256_feature_set.activate(&secp256k1_precompile_use_k256::id(), 0);
+        let k256_feature_set = FeatureSet::all_enabled();
 
         assert_eq!(
             test_verify_with_alignment(
