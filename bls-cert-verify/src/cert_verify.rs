@@ -8,9 +8,8 @@ use {
     bitvec::vec::BitVec,
     rayon::{iter::IntoParallelRefIterator, join},
     solana_bls_signatures::{
-        BlsError, PreparedHashedMessage, PubkeyProjective, Signature as BlsSignature,
-        SignatureProjective, VerifiablePubkey, pubkey::PubkeyAffine as BlsPubkeyAffine,
-        signature::AsSignatureAffine,
+        BlsError, PubkeyProjective, Signature as BlsSignature, SignatureProjective,
+        VerifiablePubkey, pubkey::PubkeyAffine as BlsPubkeyAffine, signature::AsSignatureAffine,
     },
     solana_signer_store::{DecodeError, Decoded, decode},
     thiserror::Error,
@@ -74,11 +73,11 @@ pub fn verify_certificate(
     };
 
     let (primary_vote, fallback_vote) = get_vote_payloads(cert.cert_type);
-    let primary_payload = prepare_payload(&primary_vote);
+    let primary_payload = serialize_vote(&primary_vote);
 
     if let Some(fallback_vote) = fallback_vote {
-        let fallback_payload = prepare_payload(&fallback_vote);
-        verify_base3_prepared(
+        let fallback_payload = serialize_vote(&fallback_vote);
+        verify_base3(
             &primary_payload,
             &fallback_payload,
             &cert.signature,
@@ -87,7 +86,7 @@ pub fn verify_certificate(
             accumulating_rank_map,
         )
     } else {
-        verify_base2_prepared(
+        verify_base2(
             &primary_payload,
             &cert.signature,
             &cert.bitmap,
@@ -124,10 +123,6 @@ fn serialize_vote(vote: &Vote) -> Vec<u8> {
     wincode::serialize(vote).expect("Vote serialization should never fail for valid Vote structs")
 }
 
-fn prepare_payload(vote: &Vote) -> PreparedHashedMessage {
-    PreparedHashedMessage::new(&serialize_vote(vote))
-}
-
 /// Verifies a signature for a single payload signed by a set of validators.
 ///
 /// This function handles the "Base2" case where all participating validators have signed
@@ -135,23 +130,6 @@ fn prepare_payload(vote: &Vote) -> PreparedHashedMessage {
 /// cases in practice.
 pub fn verify_base2<S: AsSignatureAffine>(
     payload: &[u8],
-    signature: &S,
-    ranks: &[u8],
-    max_validators: usize,
-    rank_map: impl FnMut(usize) -> Option<BlsPubkeyAffine>,
-) -> Result<(), Error> {
-    let prepared_payload = PreparedHashedMessage::new(payload);
-    verify_base2_prepared(
-        &prepared_payload,
-        signature,
-        ranks,
-        max_validators,
-        rank_map,
-    )
-}
-
-fn verify_base2_prepared<S: AsSignatureAffine>(
-    payload: &PreparedHashedMessage,
     signature: &S,
     ranks: &[u8],
     max_validators: usize,
@@ -166,14 +144,14 @@ fn verify_base2_prepared<S: AsSignatureAffine>(
 }
 
 fn verify_single_vote_signature<S: AsSignatureAffine>(
-    payload: &PreparedHashedMessage,
+    payload: &[u8],
     signature: &S,
     ranks: &BitVec<u8>,
     rank_map: impl FnMut(usize) -> Option<BlsPubkeyAffine>,
 ) -> Result<(), Error> {
     let pubkeys = collect_pubkeys(ranks, rank_map)?;
     let agg_pubkey = aggregate_pubkeys(&pubkeys)?;
-    Ok(agg_pubkey.verify_signature_prepared(signature, payload)?)
+    Ok(agg_pubkey.verify_signature(signature, payload)?)
 }
 
 /// Verifies a signature for a split-vote scenario involving two distinct payloads.
@@ -182,9 +160,9 @@ fn verify_single_vote_signature<S: AsSignatureAffine>(
 /// between signing a primary `payload` and a `fallback_payload`. This path is used
 /// only in rare edge cases where a fallback vote is required.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-fn verify_base3_prepared(
-    payload: &PreparedHashedMessage,
-    fallback_payload: &PreparedHashedMessage,
+fn verify_base3(
+    payload: &[u8],
+    fallback_payload: &[u8],
     signature: &BlsSignature,
     ranks: &[u8],
     max_validators: usize,
@@ -206,15 +184,12 @@ fn verify_base3_prepared(
             );
 
             let pubkeys = [primary_agg_res?, fallback_agg_res?];
-            // TODO: The Prepared types are ~19kb, so this is a very heavy clone.
-            // Update the API so we can pass the reference
-            let payloads = [payload.clone(), fallback_payload.clone()];
 
-            Ok(
-                SignatureProjective::par_verify_distinct_aggregated_prepared(
-                    &pubkeys, signature, &payloads,
-                )?,
-            )
+            Ok(SignatureProjective::par_verify_distinct_aggregated(
+                &pubkeys,
+                signature,
+                &[payload, fallback_payload],
+            )?)
         }
     }
 }
