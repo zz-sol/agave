@@ -151,6 +151,7 @@ dependencies = [
  "bincode",
  "digest 0.10.7",
  "ed25519-dalek 1.0.1",
+ "k256",
  "libsecp256k1",
  "openssl",
  "sha3",
@@ -160,6 +161,7 @@ dependencies = [
  "solana-pubkey 4.1.0",
  "solana-sdk-ids",
  "solana-secp256k1-program",
+ "solana-secp256k1-recover",
  "solana-secp256r1-program",
 ]
 
