@@ -123,6 +123,7 @@ type CompletedRanges = Vec<Range<u32>>;
 pub struct SignatureInfosForAddress {
     pub infos: Vec<ConfirmedTransactionStatusWithSignature>,
     pub found_before: bool,
+    pub found_until: bool,
 }
 
 #[derive(Error, Debug)]
@@ -3555,20 +3556,24 @@ impl Blockstore {
         // Generate a HashSet of signatures that should be excluded from the results based on
         // `until` signature
         let mut get_until_slot_timer = Measure::start("get_until_slot_timer");
-        let (lowest_slot, until_excluded_signatures) = match until {
-            None => (first_available_block, HashSet::new()),
+        let (lowest_slot, until_excluded_signatures, found_until) = match until {
+            None => (first_available_block, HashSet::new(), false),
             Some(until) => {
                 let transaction_status =
                     self.get_transaction_status(until, &confirmed_unrooted_slots)?;
                 match transaction_status {
-                    None => (first_available_block, HashSet::new()),
+                    None => (first_available_block, HashSet::new(), false),
                     Some((slot, _)) => {
                         let mut slot_signatures = self.get_block_signatures_rev(slot)?;
                         if let Some(pos) = slot_signatures.iter().position(|&x| x == until) {
                             slot_signatures = slot_signatures.split_off(pos);
                         }
 
-                        (slot, slot_signatures.into_iter().collect::<HashSet<_>>())
+                        (
+                            slot,
+                            slot_signatures.into_iter().collect::<HashSet<_>>(),
+                            true,
+                        )
                     }
                 }
             }
@@ -3678,6 +3683,7 @@ impl Blockstore {
         Ok(SignatureInfosForAddress {
             infos,
             found_before: true, // if `before` signature was not found, this method returned early
+            found_until,
         })
     }
 
@@ -4901,6 +4907,20 @@ impl Blockstore {
     pub fn write_batch(&self, write_batch: WriteBatch) -> Result<()> {
         self.db.write(write_batch)
     }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn insert_shreds_and_meta_for_bank(&self, bank: Arc<Bank>) {
+        let entries = create_ticks(bank.ticks_per_slot(), 1, Hash::new_unique());
+        let shreds = entries_to_test_shreds(&entries, bank.slot(), bank.parent_slot(), true, 0);
+        let num_shreds = shreds.len() as u64;
+        self.insert_shreds(shreds, None, false).unwrap();
+        let mut meta = self.meta(bank.slot()).unwrap().unwrap();
+        meta.consumed = num_shreds;
+        meta.received = num_shreds;
+        meta.last_index = Some(num_shreds - 1);
+        meta.completed_data_indexes.insert(num_shreds as u32 - 1);
+        self.put_meta(bank.slot(), &meta).unwrap();
+    }
 }
 
 // Updates the `completed_data_indexes` with a new shred `new_shred_index`.
@@ -5524,7 +5544,7 @@ pub mod tests {
         solana_transaction_status::{
             InnerInstruction, InnerInstructions, Reward, Rewards, TransactionTokenBalance,
         },
-        std::{cmp::Ordering, time::Duration},
+        std::{cmp::Ordering, num::NonZeroUsize, time::Duration},
     };
 
     // used for tests only
@@ -10179,10 +10199,13 @@ pub mod tests {
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let fixed_schedule = FixedSchedule {
-            leader_schedule: Arc::new(LeaderSchedule::new_from_schedule(vec![SlotLeader {
-                id: leader_keypair.pubkey(),
-                vote_address: Pubkey::new_unique(),
-            }])),
+            leader_schedule: Arc::new(LeaderSchedule::new_from_schedule(
+                vec![SlotLeader {
+                    id: leader_keypair.pubkey(),
+                    vote_address: Pubkey::new_unique(),
+                }],
+                NonZeroUsize::new(1).unwrap(),
+            )),
         };
         leader_schedule_cache.set_fixed_leader_schedule(Some(fixed_schedule));
 

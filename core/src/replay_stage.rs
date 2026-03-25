@@ -5481,11 +5481,8 @@ pub(crate) mod tests {
             DefaultSchedulerPool::new_for_verification(None, None, None, None, None),
         );
 
-        let bank = bank_forks.write().unwrap().insert(Bank::new_from_parent(
-            bank,
-            SlotLeader::default(),
-            1,
-        ));
+        let child_bank = Bank::new_from_parent(bank, SlotLeader::default(), 1);
+        let bank = bank_forks.write().unwrap().insert(child_bank);
 
         let slot = bank.slot();
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
@@ -5878,10 +5875,11 @@ pub(crate) mod tests {
                 )
                 .unwrap();
 
+            let child_bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
             let bank1 = bank_forks
                 .write()
                 .unwrap()
-                .insert(Bank::new_from_parent(bank0, SlotLeader::default(), 1))
+                .insert(child_bank)
                 .clone_without_scheduler();
             let slot = bank1.slot();
 
@@ -6411,17 +6409,17 @@ pub(crate) mod tests {
         let stake = 10_000;
         let (bank_forks_arc, mut progress_map, _) =
             vote_simulator::initialize_state(&keypairs, stake);
-        let mut bank_forks = bank_forks_arc.write().unwrap();
 
-        let bank0 = bank_forks.get(0).unwrap();
-        bank_forks.insert(Bank::new_from_parent(
+        let bank0 = bank_forks_arc.read().unwrap().get(0).unwrap();
+        Bank::new_from_parent_with_bank_forks(
+            &bank_forks_arc,
             bank0.clone(),
             SlotLeader::default(),
             9,
-        ));
-        let bank9 = bank_forks.get(9).unwrap();
-        bank_forks.insert(Bank::new_from_parent(bank9, SlotLeader::default(), 10));
-        bank_forks.set_root(9, None, None);
+        );
+        let bank9 = bank_forks_arc.read().unwrap().get(9).unwrap();
+        Bank::new_from_parent_with_bank_forks(&bank_forks_arc, bank9, SlotLeader::default(), 10);
+        bank_forks_arc.write().unwrap().set_root(9, None, None);
         let total_epoch_stake = bank0.total_epoch_stake();
 
         // Insert new ForkProgress for slot 10 and its
@@ -6456,8 +6454,6 @@ pub(crate) mod tests {
         // Make sure is_propagated == false so that the propagation logic
         // runs in `update_propagation_status`
         assert!(!progress_map.get_leader_propagation_slot_must_exist(10).0);
-
-        drop(bank_forks);
 
         let vote_tracker = VoteTracker::default();
         vote_tracker.insert_vote(10, vote_pubkey);
@@ -6514,20 +6510,24 @@ pub(crate) mod tests {
         let stake_per_validator = 10_000;
         let (bank_forks_arc, mut progress_map, _) =
             vote_simulator::initialize_state(&keypairs, stake_per_validator);
-        let mut bank_forks = bank_forks_arc.write().unwrap();
         progress_map
             .get_propagated_stats_mut(0)
             .unwrap()
             .is_leader_slot = true;
-        bank_forks.set_root(0, None, None);
-        let total_epoch_stake = bank_forks.root_bank().total_epoch_stake();
+        bank_forks_arc.write().unwrap().set_root(0, None, None);
+        let total_epoch_stake = bank_forks_arc
+            .read()
+            .unwrap()
+            .root_bank()
+            .total_epoch_stake();
 
         // Insert new ForkProgress representing a slot for all slots 1..=num_banks. Only
         // make even numbered ones leader slots
         for i in 1..=10 {
-            let parent_bank = bank_forks.get(i - 1).unwrap().clone();
+            let parent_bank = bank_forks_arc.read().unwrap().get(i - 1).unwrap().clone();
             let prev_leader_slot = ((i - 1) / 2) * 2;
-            bank_forks.insert(Bank::new_from_parent(parent_bank, SlotLeader::default(), i));
+            let bank = Bank::new_from_parent(parent_bank, SlotLeader::default(), i);
+            bank_forks_arc.write().unwrap().insert(bank);
             progress_map.insert(
                 i,
                 ForkProgress::new(
@@ -6554,8 +6554,6 @@ pub(crate) mod tests {
             // Insert a vote for the last bank for each voter
             vote_tracker.insert_vote(10, *vote_pubkey);
         }
-
-        drop(bank_forks);
 
         // The last bank should reach propagation threshold, and propagate it all
         // the way back through earlier leader banks
@@ -6597,21 +6595,21 @@ pub(crate) mod tests {
         let stake_per_validator = 10_000;
         let (bank_forks_arc, mut progress_map, _) =
             vote_simulator::initialize_state(&keypairs, stake_per_validator);
-        let mut bank_forks = bank_forks_arc.write().unwrap();
         progress_map
             .get_propagated_stats_mut(0)
             .unwrap()
             .is_leader_slot = true;
-        bank_forks.set_root(0, None, None);
+        bank_forks_arc.write().unwrap().set_root(0, None, None);
 
         let total_epoch_stake = num_validators as u64 * stake_per_validator;
 
         // Insert new ForkProgress representing a slot for all slots 1..=num_banks. Only
         // make even numbered ones leader slots
         for i in 1..=10 {
-            let parent_bank = bank_forks.get(i - 1).unwrap().clone();
+            let parent_bank = bank_forks_arc.read().unwrap().get(i - 1).unwrap().clone();
             let prev_leader_slot = i - 1;
-            bank_forks.insert(Bank::new_from_parent(parent_bank, SlotLeader::default(), i));
+            let bank = Bank::new_from_parent(parent_bank, SlotLeader::default(), i);
+            bank_forks_arc.write().unwrap().insert(bank);
             let mut fork_progress = ForkProgress::new(
                 Hash::default(),
                 Some(prev_leader_slot),
@@ -6643,7 +6641,6 @@ pub(crate) mod tests {
         // Insert a new vote
         vote_tracker.insert_vote(10, vote_pubkeys[2]);
 
-        drop(bank_forks);
         // The last bank should reach propagation threshold, and propagate it all
         // the way back through earlier leader banks
         ReplayStage::update_propagation_status(
@@ -6752,20 +6749,17 @@ pub(crate) mod tests {
 
         // If the root is now set to `parent_slot`, this filters out `previous_leader_slot` from the progress map,
         // which implies confirmation
-        let bank0 = Bank::new_for_tests(&genesis_config::create_genesis_config(10000).0);
+        let genesis_config = genesis_config::create_genesis_config(10000).0;
+        let (bank0, bank_forks_arc) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let parent_slot_bank =
-            Bank::new_from_parent(Arc::new(bank0), SlotLeader::default(), parent_slot);
-        let bank_forks = BankForks::new_rw_arc(parent_slot_bank);
-        let mut bank_forks = bank_forks.write().unwrap();
-        let bank5 = Bank::new_from_parent(
-            bank_forks.get(parent_slot).unwrap(),
-            SlotLeader::default(),
-            5,
-        );
-        bank_forks.insert(bank5);
+            Bank::new_from_parent(Arc::clone(&bank0), SlotLeader::default(), parent_slot);
+        bank_forks_arc.write().unwrap().insert(parent_slot_bank);
+        let parent_bank = bank_forks_arc.read().unwrap().get(parent_slot).unwrap();
+        let bank5 = Bank::new_from_parent(parent_bank, SlotLeader::default(), 5);
+        bank_forks_arc.write().unwrap().insert(bank5);
 
         // Should purge only `previous_leader_slot` from the progress map
-        progress_map.handle_new_root(&bank_forks);
+        progress_map.handle_new_root(&bank_forks_arc.read().unwrap());
 
         // Should succeed
         assert!(ReplayStage::check_propagation_for_start_leader(
@@ -9812,11 +9806,9 @@ pub(crate) mod tests {
         blockstore.store_duplicate_slot(4, vec![], vec![]).unwrap();
         blockstore.store_duplicate_slot(5, vec![], vec![]).unwrap();
 
-        let bank1 = bank_forks.write().unwrap().insert(Bank::new_from_parent(
-            bank0.clone_without_scheduler(),
-            SlotLeader::default(),
-            1,
-        ));
+        let bank1_child =
+            Bank::new_from_parent(bank0.clone_without_scheduler(), SlotLeader::default(), 1);
+        let bank1 = bank_forks.write().unwrap().insert(bank1_child);
         confirm_full_slot(
             &blockstore,
             &bank1,
