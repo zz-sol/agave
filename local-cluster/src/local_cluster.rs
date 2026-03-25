@@ -2,17 +2,17 @@ use {
     crate::{
         cluster::{Cluster, ClusterValidatorInfo, QuicTpuClient, ValidatorInfo},
         cluster_tests,
-        integration_tests::{ValidatorKeys, DEFAULT_NODE_STAKE},
+        integration_tests::{DEFAULT_NODE_STAKE, ValidatorKeys},
         validator_configs::*,
     },
-    agave_feature_set::FeatureSet,
+    agave_feature_set::{FeatureSet, bls_pubkey_management_in_vote_account, vote_state_v4},
     agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
     itertools::izip,
     log::*,
     solana_account::{Account, AccountSharedData, ReadableAccount},
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
     solana_client::connection_cache::ConnectionCache,
-    solana_clock::{Slot, DEFAULT_DEV_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT},
+    solana_clock::{DEFAULT_DEV_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, Slot},
     solana_cluster_type::ClusterType,
     solana_commitment_config::CommitmentConfig,
     solana_core::{
@@ -30,17 +30,17 @@ use {
     solana_ledger::{create_new_tmp_ledger_with_size, shred::Shred},
     solana_message::Message,
     solana_native_token::LAMPORTS_PER_SOL,
-    solana_net_utils::{sockets::bind_to_localhost_unique, SocketAddrSpace},
+    solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
     solana_poh_config::PohConfig,
     solana_program_binaries::core_bpf_programs,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_rpc_client::rpc_client::RpcClient,
     solana_runtime::genesis_utils::{
-        create_genesis_config_with_vote_accounts_and_cluster_type, GenesisConfigInfo,
-        ValidatorVoteKeypairs,
+        GenesisConfigInfo, ValidatorVoteKeypairs,
+        create_genesis_config_with_vote_accounts_and_cluster_type,
     },
-    solana_signer::{signers::Signers, Signer},
+    solana_signer::{Signer, signers::Signers},
     solana_stake_interface::{
         instruction as stake_instruction,
         state::{Authorized, Lockup, StakeStateV2},
@@ -48,13 +48,16 @@ use {
     solana_streamer::streamer::StakedNodes,
     solana_system_transaction as system_transaction,
     solana_tpu_client::tpu_client::{
-        TpuClient, TpuClientConfig, DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC,
+        DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC, TpuClient, TpuClientConfig,
     },
     solana_transaction::Transaction,
     solana_transaction_error::TransportError,
     solana_vote_program::{
         vote_instruction,
-        vote_state::{self, VoteInit, VoteStateV4},
+        vote_state::{
+            self, VoteAuthorize, VoteInit, VoteStateV4, VoterWithBLSArgs,
+            create_bls_pubkey_and_proof_of_possession,
+        },
     },
     std::{
         collections::HashMap,
@@ -69,6 +72,14 @@ use {
 
 pub const DEFAULT_MINT_LAMPORTS: u64 = 10_000_000 * LAMPORTS_PER_SOL;
 const DUMMY_SNAPSHOT_CONFIG_PATH_MARKER: &str = "dummy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlpenglowMode {
+    /// No alpenglow
+    Disabled,
+    /// Full alpenglow - Activates alpenglow feature and set GenesisCertificate
+    Enabled,
+}
 
 pub struct ClusterConfig {
     /// The validator config that should be applied to every node in the cluster
@@ -176,6 +187,7 @@ impl LocalCluster {
                 .0,
         ];
         config.tower_storage = Arc::new(FileTowerStorage::new(ledger_path.to_path_buf()));
+        config.accounts_db_config.bank_hash_details_dir = ledger_path.to_path_buf();
 
         let snapshot_config = &mut config.snapshot_config;
         let dummy: PathBuf = DUMMY_SNAPSHOT_CONFIG_PATH_MARKER.into();
@@ -188,6 +200,18 @@ impl LocalCluster {
     }
 
     pub fn new(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
+        Self::init(config, socket_addr_space, AlpenglowMode::Disabled)
+    }
+
+    pub fn new_alpenglow(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
+        Self::init(config, socket_addr_space, AlpenglowMode::Enabled)
+    }
+
+    pub fn init(
+        config: &mut ClusterConfig,
+        socket_addr_space: SocketAddrSpace,
+        alpenglow_mode: AlpenglowMode,
+    ) -> Self {
         assert_eq!(config.validator_configs.len(), config.node_stakes.len());
 
         let quic_connection_cache_config = {
@@ -260,12 +284,11 @@ impl LocalCluster {
                         stake
                     );
                     if *in_genesis {
+                        let node_keypair = node_keypair.insecure_clone();
+                        let vote_keypair = vote_keypair.insecure_clone();
+                        let stake_keypair = Keypair::new();
                         Some((
-                            ValidatorVoteKeypairs {
-                                node_keypair: node_keypair.insecure_clone(),
-                                vote_keypair: vote_keypair.insecure_clone(),
-                                stake_keypair: Keypair::new(),
-                            },
+                            ValidatorVoteKeypairs::new(node_keypair, vote_keypair, stake_keypair),
                             stake,
                         ))
                     } else {
@@ -298,8 +321,9 @@ impl LocalCluster {
             stakes_in_genesis,
             config.cluster_type,
             &feature_set,
-            false,
+            matches!(alpenglow_mode, AlpenglowMode::Enabled), /* is_alpenglow */
         );
+
         genesis_config.accounts.extend(
             config
                 .additional_accounts
@@ -408,6 +432,7 @@ impl LocalCluster {
                 // to use the same QUIC ports due to SO_REUSEPORT.
                 ValidatorTpuConfig::new_for_tests(),
                 Arc::new(RwLock::new(None)),
+                None,
             )
             .expect("assume successful validator start");
 
@@ -617,6 +642,7 @@ impl LocalCluster {
             socket_addr_space,
             ValidatorTpuConfig::new_for_tests(),
             Arc::new(RwLock::new(None)),
+            None,
         )
         .expect("assume successful validator start");
 
@@ -682,6 +708,7 @@ impl LocalCluster {
                 socket_addr_space,
                 ValidatorTpuConfig::new_for_tests(),
                 Arc::new(RwLock::new(None)),
+                None,
             )
             .unwrap_or_else(|e| panic!("Cluster leader failed to start: {e:?}"));
 
@@ -745,6 +772,7 @@ impl LocalCluster {
                     socket_addr_space,
                     ValidatorTpuConfig::new_for_tests(),
                     Arc::new(RwLock::new(None)),
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("Validator {i} failed to start: {e:?}"));
 
@@ -852,6 +880,46 @@ impl LocalCluster {
         info!("{test_name} done waiting for roots");
     }
 
+    pub fn check_for_new_processed(
+        &self,
+        num_new_processed: usize,
+        test_name: &str,
+        socket_addr_space: SocketAddrSpace,
+    ) {
+        let alive_node_contact_infos = self.discover_nodes(socket_addr_space, test_name);
+        info!("{test_name} looking for new processed slots on all nodes");
+        cluster_tests::check_for_new_processed(
+            num_new_processed,
+            &alive_node_contact_infos,
+            &self.connection_cache,
+            test_name,
+        );
+        info!("{test_name} done waiting for processed slots");
+    }
+
+    pub fn check_for_new_notarized_votes(
+        &self,
+        num_new_notarized_votes: usize,
+        test_name: &str,
+        socket_addr_space: SocketAddrSpace,
+        vote_listener_addr: std::net::UdpSocket,
+        validator_keys: &[Arc<Keypair>],
+        node_stakes: &[u64],
+    ) {
+        let alive_node_contact_infos = self.discover_nodes(socket_addr_space, test_name);
+        info!("{test_name} looking for new notarized votes on all nodes");
+        cluster_tests::check_for_new_notarized_votes(
+            num_new_notarized_votes,
+            &alive_node_contact_infos,
+            &self.connection_cache,
+            test_name,
+            vote_listener_addr,
+            validator_keys,
+            node_stakes,
+        );
+        info!("{test_name} done waiting for notarized votes");
+    }
+
     pub fn check_no_new_roots(
         &self,
         num_slots_to_wait: usize,
@@ -884,10 +952,11 @@ impl LocalCluster {
     }
 
     /// Poll RPC to see if transaction was processed. Return an error if unable
-    /// determine if the transaction was processed before its blockhash expires.
-    /// Return Ok(Some(())) if the transaction was processed, Ok(None) if the
-    /// transaction was not processed.
-    pub fn poll_for_processed_transaction(
+    /// to determine if the transaction was processed before its blockhash
+    /// expires or if the transaction execution result was an error. Return
+    /// Ok(Some(())) if the transaction was processed successfully. Return
+    /// Ok(None) if the transaction was not processed.
+    pub fn poll_for_successfully_processed_transaction(
         client: &QuicTpuClient,
         transaction: &Transaction,
     ) -> std::result::Result<Option<()>, TransportError> {
@@ -900,8 +969,13 @@ impl LocalCluster {
                 CommitmentConfig::processed(),
             )?;
 
-            if status.is_some() {
-                return Ok(Some(()));
+            if let Some(tx_result) = status {
+                match tx_result {
+                    Ok(_) => return Ok(Some(())),
+                    Err(e) => {
+                        return Err(TransportError::TransactionError(e));
+                    }
+                }
             }
 
             if !client.rpc_client().is_blockhash_valid(
@@ -932,7 +1006,7 @@ impl LocalCluster {
         // in LocalCluster integration tests
         for attempt in 1..=attempts {
             client.send_transaction_to_upcoming_leaders(transaction)?;
-            if Self::poll_for_processed_transaction(client, transaction)?.is_some() {
+            if Self::poll_for_successfully_processed_transaction(client, transaction)?.is_some() {
                 return Ok(());
             }
 
@@ -969,6 +1043,20 @@ impl LocalCluster {
             .expect("client transfer should succeed");
     }
 
+    fn is_feature_active(rpc_client: &RpcClient, feature_id: &Pubkey) -> bool {
+        rpc_client
+            .get_account_with_commitment(feature_id, CommitmentConfig::processed())
+            .ok()
+            .and_then(|r| r.value)
+            .and_then(|account| solana_feature_gate_interface::from_account(&account))
+            .is_some_and(|feature| feature.activated_at.is_some())
+    }
+
+    fn is_bls_pubkey_feature_enabled(rpc_client: &RpcClient) -> bool {
+        Self::is_feature_active(rpc_client, &bls_pubkey_management_in_vote_account::id())
+            && Self::is_feature_active(rpc_client, &vote_state_v4::id())
+    }
+
     fn setup_vote_and_stake_accounts(
         client: &QuicTpuClient,
         vote_account: &Keypair,
@@ -990,8 +1078,8 @@ impl LocalCluster {
             .unwrap_or(0)
             == 0
         {
-            // 1) Create vote account
-            let instructions = vote_instruction::create_account_with_config(
+            // 1) Create vote account — always use V1 InitializeAccount
+            let mut instructions = vote_instruction::create_account_with_config(
                 &from_account.pubkey(),
                 &vote_account_pubkey,
                 &VoteInit {
@@ -1006,6 +1094,21 @@ impl LocalCluster {
                     ..vote_instruction::CreateVoteAccountConfig::default()
                 },
             );
+
+            // If BLS feature is active, append an authorize instruction to set the BLS key
+            if Self::is_bls_pubkey_feature_enabled(client.rpc_client()) {
+                let (bls_pubkey, bls_proof_of_possession) =
+                    create_bls_pubkey_and_proof_of_possession(&vote_account_pubkey);
+                instructions.push(vote_instruction::authorize(
+                    &vote_account_pubkey,
+                    &vote_account_pubkey,
+                    &vote_account_pubkey,
+                    VoteAuthorize::VoterWithBLS(VoterWithBLSArgs {
+                        bls_pubkey,
+                        bls_proof_of_possession,
+                    }),
+                ));
+            }
             let message = Message::new(&instructions, Some(&from_account.pubkey()));
             let mut transaction = Transaction::new(
                 &[from_account.as_ref(), vote_account],
@@ -1136,7 +1239,7 @@ impl LocalCluster {
         let cache = match &*self.connection_cache {
             ConnectionCache::Quic(cache) => cache,
             ConnectionCache::Udp(_) => {
-                return Err(Error::other("Expected a Quic ConnectionCache. Got UDP"))
+                return Err(Error::other("Expected a Quic ConnectionCache. Got UDP"));
             }
         };
 
@@ -1298,6 +1401,7 @@ impl Cluster for LocalCluster {
             socket_addr_space,
             ValidatorTpuConfig::new_for_tests(),
             Arc::new(RwLock::new(None)),
+            None,
         )
         .expect("assume successful validator start");
         cluster_validator_info.validator = Some(restarted_node);

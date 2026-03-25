@@ -503,7 +503,11 @@ fn network_run_pull(
         let mut ping_cache = node.ping_cache.lock().unwrap();
         for other in &network_values {
             if node.keypair.pubkey() != other.keypair.pubkey() {
-                ping_cache.mock_pong(other.contact_info.gossip().unwrap(), Instant::now());
+                ping_cache.mock_pong(
+                    other.keypair.pubkey(),
+                    other.contact_info.gossip().unwrap(),
+                    Instant::now(),
+                );
             }
         }
     }
@@ -588,7 +592,6 @@ fn network_run_pull(
                                 usize::MAX, // output_size_limit
                                 now,
                                 |_| true, // should_retain_crds_value
-                                0,        // network shred version
                                 &GossipStats::default(),
                             )
                             .into_iter()

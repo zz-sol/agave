@@ -9,9 +9,10 @@ use {
         standard_broadcast_run::StandardBroadcastRun,
     },
     crate::{
+        XdpSender,
         cluster_nodes::{ClusterNodes, ClusterNodesCache},
-        xdp::XdpSender,
     },
+    agave_votor::event::VotorEventSender,
     crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, unbounded},
     itertools::Itertools,
     solana_clock::Slot,
@@ -123,7 +124,9 @@ impl BroadcastStageType {
         bank_forks: Arc<RwLock<BankForks>>,
         shred_version: u16,
         xdp_sender: Option<XdpSender>,
+        votor_event_sender: VotorEventSender,
     ) -> BroadcastStage {
+        let migration_status = bank_forks.read().unwrap().migration_status();
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
                 sock,
@@ -133,7 +136,7 @@ impl BroadcastStageType {
                 exit_sender,
                 blockstore,
                 bank_forks,
-                StandardBroadcastRun::new(shred_version),
+                StandardBroadcastRun::new(shred_version, migration_status, votor_event_sender),
                 xdp_sender,
             ),
 
@@ -169,7 +172,12 @@ impl BroadcastStageType {
                 exit_sender,
                 blockstore,
                 bank_forks,
-                BroadcastDuplicatesRun::new(shred_version, config.clone()),
+                BroadcastDuplicatesRun::new(
+                    shred_version,
+                    config.clone(),
+                    migration_status,
+                    votor_event_sender,
+                ),
                 xdp_sender,
             ),
         }
@@ -510,7 +518,7 @@ pub fn broadcast_shreds(
                 let addr = cluster_nodes
                     .get_broadcast_peer(&key)?
                     .tvu(Protocol::UDP)
-                    .filter(|addr| socket_addr_space.check(addr))?;
+                    .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))?;
 
                 Some((shred.payload(), addr))
             })
@@ -536,7 +544,7 @@ pub fn broadcast_shreds(
         BroadcastSocket::Xdp(s) => {
             let mut send_xdp_time = Measure::start("send_xdp");
             for (idx, (payload, addr)) in packets.into_iter().enumerate() {
-                if let Err(e) = s.try_send(idx, addr, payload.clone()) {
+                if let Err(e) = s.try_send(idx, addr, payload.bytes.clone()) {
                     log::warn!("xdp channel full: {e:?}");
                     transmit_stats.dropped_packets_xdp += 1;
                     result = Err(Error::XdpChannelFull);
@@ -561,7 +569,8 @@ impl<T> From<crossbeam_channel::SendError<T>> for Error {
 pub mod test {
     use {
         super::*,
-        crossbeam_channel::unbounded,
+        agave_votor_messages::migration::MigrationStatus,
+        crossbeam_channel::{bounded, unbounded},
         rand::Rng,
         solana_entry::entry::create_ticks,
         solana_gossip::{cluster_info::ClusterInfo, node::Node},
@@ -732,6 +741,9 @@ pub mod test {
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank = bank_forks.read().unwrap().root_bank();
 
+        // Create votor event channel for test
+        let (votor_event_sender, _votor_event_receiver) = bounded(100);
+
         // Start up the broadcast stage
         let broadcast_service = BroadcastStage::new(
             leader_info.sockets.broadcast,
@@ -741,7 +753,7 @@ pub mod test {
             exit_sender,
             blockstore.clone(),
             bank_forks,
-            StandardBroadcastRun::new(0),
+            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender),
             None,
         );
 

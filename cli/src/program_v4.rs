@@ -3,30 +3,30 @@ use {
         checks::*,
         cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
         compute_budget::{
-            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+            ComputeUnitConfig, WithComputeUnitConfig, simulate_and_update_compute_unit_limit,
         },
-        feature::{status_from_account, CliFeatureStatus},
+        feature::{CliFeatureStatus, status_from_account},
         program::calculate_max_chunk_size,
     },
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
-    clap::{value_t, App, AppSettings, Arg, ArgMatches, SubCommand},
+    agave_feature_set::{FEATURE_NAMES, FeatureSet, raise_cpi_nesting_limit_to_8},
+    clap::{App, AppSettings, Arg, ArgMatches, SubCommand, value_t},
     log::*,
     solana_account::Account,
     solana_account_decoder::{UiAccount, UiAccountEncoding, UiDataSliceConfig},
     solana_clap_utils::{
-        compute_budget::{compute_unit_price_arg, ComputeUnitLimit},
+        compute_budget::{ComputeUnitLimit, compute_unit_price_arg},
         input_parsers::{pubkey_of, pubkey_of_signer, signer_of},
         input_validators::{is_valid_pubkey, is_valid_signer},
         keypair::{DefaultSigner, SignerIndex},
-        offline::{OfflineArgs, DUMP_TRANSACTION_MESSAGE, SIGN_ONLY_ARG},
+        offline::{DUMP_TRANSACTION_MESSAGE, OfflineArgs, SIGN_ONLY_ARG},
     },
     solana_cli_output::{
-        return_signers_with_config, CliProgramId, CliProgramV4, CliProgramsV4, ReturnSignersConfig,
+        CliProgramId, CliProgramV4, CliProgramsV4, ReturnSignersConfig, return_signers_with_config,
     },
     solana_client::{
         connection_cache::ConnectionCache,
         send_and_confirm_transactions_in_parallel::{
-            send_and_confirm_transactions_in_parallel_v2, SendAndConfirmConfigV2,
+            SendAndConfirmConfigV2, send_and_confirm_transactions_in_parallel_v2,
         },
     },
     solana_instruction::Instruction,
@@ -53,7 +53,7 @@ use {
     solana_sbpf::{elf::Executable, verifier::RequisiteVerifier},
     solana_sdk_ids::{loader_v4, system_program},
     solana_signer::Signer,
-    solana_system_interface::{instruction as system_instruction, MAX_PERMITTED_DATA_LENGTH},
+    solana_system_interface::{MAX_PERMITTED_DATA_LENGTH, instruction as system_instruction},
     solana_tpu_client::tpu_client::TpuClientConfig,
     solana_transaction::Transaction,
     std::{
@@ -397,10 +397,11 @@ pub fn parse_program_v4_subcommand(
             let authority_signer_index = signer_info
                 .index_of(authority_pubkey)
                 .expect("Authority signer is missing");
-            assert!(
-                program_address.is_some() != program_signer_index.is_some(),
-                "Requires either --program-keypair or --program-id",
-            );
+            if program_address.is_some() == program_signer_index.is_some() {
+                return Err(CliError::BadParameter(
+                    "Requires either --program-keypair or --program-id".to_string(),
+                ));
+            }
 
             CliCommandInfo {
                 command: CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
@@ -735,7 +736,7 @@ pub async fn process_deploy_program(
                 }
             });
     }
-    let program_runtime_environment = agave_syscalls::create_program_runtime_environment_v1(
+    let program_runtime_environment = agave_syscalls::create_program_runtime_environment(
         &feature_set.runtime_features(),
         &SVMTransactionExecutionBudget::new_with_defaults(
             feature_set.is_active(&raise_cpi_nesting_limit_to_8::id()),
@@ -766,9 +767,11 @@ pub async fn process_deploy_program(
         )
         .into());
     }
-    let executable =
-        Executable::<InvokeContext>::from_elf(program_data, Arc::new(program_runtime_environment))
-            .map_err(|err| format!("ELF error: {err}"))?;
+    let executable = Executable::<InvokeContext>::from_elf(
+        program_data,
+        Arc::clone(&*program_runtime_environment),
+    )
+    .map_err(|err| format!("ELF error: {err}"))?;
     executable
         .verify::<RequisiteVerifier>()
         .map_err(|err| format!("ELF error: {err}"))?;
@@ -1610,7 +1613,7 @@ mod tests {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
         serde_json::json,
-        solana_keypair::{keypair_from_seed, read_keypair_file, write_keypair_file, Keypair},
+        solana_keypair::{Keypair, keypair_from_seed, read_keypair_file, write_keypair_file},
         solana_rpc_client_api::{
             request::RpcRequest,
             response::{Response, RpcResponseContext},
@@ -1700,61 +1703,69 @@ mod tests {
         config.signers.push(&program_signer);
         config.signers.push(&authority_signer);
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_no_existing_program()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_signer.pubkey(),
-            None,
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_no_existing_program()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_signer.pubkey(),
+                None,
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_ok()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_no_existing_program()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_signer.pubkey(),
-            Some(&program_signer.pubkey()),
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_no_existing_program()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_signer.pubkey(),
+                Some(&program_signer.pubkey()),
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_ok()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_wrong_account_owner()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_signer.pubkey(),
-            None,
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_wrong_account_owner()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_signer.pubkey(),
+                None,
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_with_program_deployed()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_signer.pubkey(),
-            None,
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_with_program_deployed()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_signer.pubkey(),
+                None,
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1772,89 +1783,101 @@ mod tests {
         config.signers.push(&authority_signer);
 
         // Redeploying a non-existent program should fail
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_no_existing_program()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_no_existing_program()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_with_program_retracted()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_with_program_retracted()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_ok()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_with_program_deployed()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_with_program_deployed()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_ok()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_with_program_finalized()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_with_program_finalized()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_wrong_account_owner()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_wrong_account_owner()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_wrong_authority()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            None,
-            None,
-            &1,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_wrong_authority()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                None,
+                None,
+                &1,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1874,47 +1897,53 @@ mod tests {
         config.signers.push(&authority_signer);
 
         // Redeploying a non-existent program should fail
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_no_existing_program()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            Some(&buffer_signer.pubkey()),
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_no_existing_program()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                Some(&buffer_signer.pubkey()),
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_wrong_account_owner()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            Some(&buffer_signer.pubkey()),
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_wrong_account_owner()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                Some(&buffer_signer.pubkey()),
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(process_deploy_program(
-            Arc::new(rpc_client_wrong_authority()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &program_address,
-            Some(&buffer_signer.pubkey()),
-            Some(&1),
-            &2,
-            &program_data,
-            None..None,
-        )
-        .await
-        .is_err());
+        assert!(
+            process_deploy_program(
+                Arc::new(rpc_client_wrong_authority()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &program_address,
+                Some(&buffer_signer.pubkey()),
+                Some(&1),
+                &2,
+                &program_data,
+                None..None,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1929,16 +1958,18 @@ mod tests {
         config.signers.push(&authority_signer);
 
         for close_program_entirely in [false, true] {
-            assert!(process_retract_program(
-                Arc::new(rpc_client_no_existing_program()),
-                &config,
-                &AdditionalCliConfig::default(),
-                &1,
-                &program_signer.pubkey(),
-                close_program_entirely,
-            )
-            .await
-            .is_err());
+            assert!(
+                process_retract_program(
+                    Arc::new(rpc_client_no_existing_program()),
+                    &config,
+                    &AdditionalCliConfig::default(),
+                    &1,
+                    &program_signer.pubkey(),
+                    close_program_entirely,
+                )
+                .await
+                .is_err()
+            );
 
             assert!(
                 process_retract_program(
@@ -1954,49 +1985,57 @@ mod tests {
                     == close_program_entirely
             );
 
-            assert!(process_retract_program(
-                Arc::new(rpc_client_with_program_deployed()),
-                &config,
-                &AdditionalCliConfig::default(),
-                &1,
-                &program_signer.pubkey(),
-                close_program_entirely,
-            )
-            .await
-            .is_ok());
+            assert!(
+                process_retract_program(
+                    Arc::new(rpc_client_with_program_deployed()),
+                    &config,
+                    &AdditionalCliConfig::default(),
+                    &1,
+                    &program_signer.pubkey(),
+                    close_program_entirely,
+                )
+                .await
+                .is_ok()
+            );
 
-            assert!(process_retract_program(
-                Arc::new(rpc_client_with_program_finalized()),
-                &config,
-                &AdditionalCliConfig::default(),
-                &1,
-                &program_signer.pubkey(),
-                close_program_entirely,
-            )
-            .await
-            .is_err());
+            assert!(
+                process_retract_program(
+                    Arc::new(rpc_client_with_program_finalized()),
+                    &config,
+                    &AdditionalCliConfig::default(),
+                    &1,
+                    &program_signer.pubkey(),
+                    close_program_entirely,
+                )
+                .await
+                .is_err()
+            );
 
-            assert!(process_retract_program(
-                Arc::new(rpc_client_wrong_account_owner()),
-                &config,
-                &AdditionalCliConfig::default(),
-                &1,
-                &program_signer.pubkey(),
-                close_program_entirely,
-            )
-            .await
-            .is_err());
+            assert!(
+                process_retract_program(
+                    Arc::new(rpc_client_wrong_account_owner()),
+                    &config,
+                    &AdditionalCliConfig::default(),
+                    &1,
+                    &program_signer.pubkey(),
+                    close_program_entirely,
+                )
+                .await
+                .is_err()
+            );
 
-            assert!(process_retract_program(
-                Arc::new(rpc_client_wrong_authority()),
-                &config,
-                &AdditionalCliConfig::default(),
-                &1,
-                &program_signer.pubkey(),
-                close_program_entirely,
-            )
-            .await
-            .is_err());
+            assert!(
+                process_retract_program(
+                    Arc::new(rpc_client_wrong_authority()),
+                    &config,
+                    &AdditionalCliConfig::default(),
+                    &1,
+                    &program_signer.pubkey(),
+                    close_program_entirely,
+                )
+                .await
+                .is_err()
+            );
         }
     }
 
@@ -2013,16 +2052,18 @@ mod tests {
         config.signers.push(&authority_signer);
         config.signers.push(&new_authority_signer);
 
-        assert!(process_transfer_authority_of_program(
-            Arc::new(rpc_client_with_program_deployed()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &1,
-            &2,
-            &program_signer.pubkey(),
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_transfer_authority_of_program(
+                Arc::new(rpc_client_with_program_deployed()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &1,
+                &2,
+                &program_signer.pubkey(),
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2038,16 +2079,18 @@ mod tests {
         config.signers.push(&authority_signer);
         config.signers.push(&next_version_signer);
 
-        assert!(process_finalize_program(
-            Arc::new(rpc_client_with_program_deployed()),
-            &config,
-            &AdditionalCliConfig::default(),
-            &1,
-            &2,
-            &program_signer.pubkey(),
-        )
-        .await
-        .is_ok());
+        assert!(
+            process_finalize_program(
+                Arc::new(rpc_client_with_program_deployed()),
+                &config,
+                &AdditionalCliConfig::default(),
+                &1,
+                &2,
+                &program_signer.pubkey(),
+            )
+            .await
+            .is_ok()
+        );
     }
 
     fn make_tmp_path(name: &str) -> String {

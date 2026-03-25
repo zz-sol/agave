@@ -6,18 +6,21 @@ use {
     },
     crate::{
         accounts_background_service::{PrunedBanksRequestHandler, SendDroppedBankCallback},
+        bank::BankRc,
         bank_client::BankClient,
         bank_forks::BankForks,
         genesis_utils::{
-            self, activate_all_features, activate_feature, bootstrap_validator_stake_lamports,
+            self, GenesisConfigInfo, ValidatorVoteKeypairs, activate_all_features,
+            activate_feature, bootstrap_validator_stake_lamports,
             create_genesis_config_with_leader, create_genesis_config_with_vote_accounts,
             create_lockup_stake_account, genesis_sysvar_and_builtin_program_lamports,
-            GenesisConfigInfo, ValidatorVoteKeypairs,
+            minimum_vote_account_balance_for_vat,
         },
+        runtime_config::RuntimeConfig,
+        serde_snapshot::fields_from_stream,
         stake_history::StakeHistory,
         stake_utils,
         stakes::InvalidCacheEntryReason,
-        status_cache::MAX_CACHE_ENTRIES,
     },
     agave_feature_set::{self as feature_set, FeatureSet},
     agave_reserved_account_keys::ReservedAccount,
@@ -25,27 +28,27 @@ use {
     ahash::AHashMap,
     assert_matches::assert_matches,
     crossbeam_channel::{bounded, unbounded},
-    ed25519_dalek::ed25519::signature::Signer as EdSigner,
     itertools::Itertools,
     rand::Rng,
-    rayon::{iter::IntoParallelIterator, ThreadPool, ThreadPoolBuilder},
+    rayon::{ThreadPool, ThreadPoolBuilder, iter::IntoParallelIterator},
     serde::{Deserialize, Serialize},
     solana_account::{
-        accounts_equal, create_account_shared_data_with_fields as create_account, from_account,
-        state_traits::StateMut, Account, AccountSharedData, ReadableAccount, WritableAccount,
+        Account, AccountSharedData, ReadableAccount, WritableAccount, accounts_equal,
+        create_account_shared_data_with_fields as create_account, from_account,
+        state_traits::StateMut,
     },
     solana_account_info::MAX_PERMITTED_DATA_INCREASE,
     solana_accounts_db::{
         accounts::AccountAddressFilter,
         accounts_index::{
-            AccountIndex, AccountSecondaryIndexes, IndexKey, ScanConfig, ScanError, ITER_BATCH_SIZE,
+            AccountIndex, AccountSecondaryIndexes, ITER_BATCH_SIZE, IndexKey, ScanConfig, ScanError,
         },
         ancestors::Ancestors,
     },
     solana_client_traits::SyncClient,
     solana_clock::{
-        BankId, Epoch, Slot, UnixTimestamp, DEFAULT_TICKS_PER_SLOT, INITIAL_RENT_EPOCH,
-        MAX_PROCESSING_AGE, MAX_RECENT_BLOCKHASHES,
+        BankId, DEFAULT_TICKS_PER_SLOT, Epoch, INITIAL_RENT_EPOCH, MAX_PROCESSING_AGE,
+        MAX_RECENT_BLOCKHASHES, Slot, UnixTimestamp,
     },
     solana_cluster_type::ClusterType,
     solana_compute_budget::{
@@ -62,15 +65,15 @@ use {
     solana_fee_structure::FeeStructure,
     solana_genesis_config::GenesisConfig,
     solana_hash::Hash,
-    solana_instruction::{error::InstructionError, AccountMeta, Instruction},
-    solana_keypair::{keypair_from_seed, Keypair},
+    solana_instruction::{AccountMeta, Instruction, error::InstructionError},
+    solana_keypair::{Keypair, keypair_from_seed},
     solana_loader_v3_interface::{
         get_program_data_address, instruction::UpgradeableLoaderInstruction,
         state::UpgradeableLoaderState,
     },
     solana_loader_v4_interface::{instruction as loader_v4, state::LoaderV4State},
     solana_message::{
-        compiled_instruction::CompiledInstruction, Message, MessageHeader, SanitizedMessage,
+        Message, MessageHeader, SanitizedMessage, compiled_instruction::CompiledInstruction,
     },
     solana_native_token::LAMPORTS_PER_SOL,
     solana_nonce::{self as nonce, state::DurableNonce},
@@ -80,9 +83,10 @@ use {
         declare_process_instruction,
         execution_budget::{self, MAX_COMPUTE_UNIT_LIMIT},
         loaded_programs::{ProgramCacheEntry, ProgramCacheEntryType},
+        solana_sbpf::program::BuiltinFunctionDefinition,
     },
     solana_pubkey::Pubkey,
-    solana_rent::Rent,
+    solana_rent::{DEFAULT_LAMPORTS_PER_BYTE, Rent},
     solana_reward_info::RewardType,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_upgradeable, ed25519_program, incinerator, native_loader,
@@ -104,22 +108,23 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_system_interface::{
+        MAX_PERMITTED_ACCOUNTS_DATA_ALLOCATIONS_PER_TRANSACTION, MAX_PERMITTED_DATA_LENGTH,
         error::SystemError,
         instruction::{self as system_instruction},
-        program as system_program, MAX_PERMITTED_ACCOUNTS_DATA_ALLOCATIONS_PER_TRANSACTION,
-        MAX_PERMITTED_DATA_LENGTH,
+        program as system_program,
     },
     solana_system_transaction as system_transaction, solana_sysvar as sysvar,
     solana_transaction::{
-        sanitized::SanitizedTransaction, Transaction, TransactionVerificationMode,
+        Transaction, TransactionVerificationMode, sanitized::SanitizedTransaction,
     },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    solana_vote_interface::state::{TowerSync, BLS_PUBLIC_KEY_COMPRESSED_SIZE},
+    solana_vote_interface::state::{BLS_PUBLIC_KEY_COMPRESSED_SIZE, TowerSync},
     solana_vote_program::{
         vote_instruction,
         vote_state::{
-            self, create_v4_account_with_authorized, BlockTimestamp, VoteAuthorize, VoteInit,
-            VoteStateV4, VoteStateVersions, MAX_LOCKOUT_HISTORY,
+            self, BlockTimestamp, MAX_LOCKOUT_HISTORY, VoteAuthorize, VoteInit, VoteStateV4,
+            VoteStateVersions, VoterWithBLSArgs, create_bls_pubkey_and_proof_of_possession,
+            create_v4_account_with_authorized,
         },
     },
     spl_generic_token::token,
@@ -127,14 +132,14 @@ use {
         collections::{BTreeMap, HashMap, HashSet},
         convert::TryInto,
         fs::File,
-        io::Read,
+        io::{Cursor, Read},
         str::FromStr,
         sync::{
+            Arc,
             atomic::{
                 AtomicBool, AtomicU64, AtomicUsize,
                 Ordering::{Relaxed, Release},
             },
-            Arc,
         },
         thread::Builder,
         time::{Duration, Instant},
@@ -142,31 +147,20 @@ use {
     test_case::test_case,
 };
 
-impl VoteReward {
+impl RewardCommission {
     pub fn new_random() -> Self {
         let mut rng = rand::rng();
 
-        let validator_pubkey = solana_pubkey::new_rand();
-        let validator_stake_lamports = rng.random_range(1..200);
-        let validator_voting_keypair = Keypair::new();
+        let commission_balance = rng.random_range(1..200);
         let commission_bps: u16 = rng.random_range(100..2_000);
 
-        let validator_vote_account = vote_state::create_v4_account_with_authorized(
-            &validator_pubkey,
-            &validator_voting_keypair.pubkey(),
-            [0u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE],
-            &validator_voting_keypair.pubkey(),
-            commission_bps,
-            &validator_voting_keypair.pubkey(),
-            0,
-            &validator_voting_keypair.pubkey(),
-            validator_stake_lamports,
-        );
+        let mut commission_account = AccountSharedData::default();
+        commission_account.set_lamports(commission_balance);
 
         Self {
-            vote_account: validator_vote_account,
+            commission_account,
             commission_bps,
-            vote_rewards: rng.random_range(1..200),
+            commission_lamports: rng.random_range(1..200),
         }
     }
 }
@@ -203,27 +197,35 @@ fn test_race_register_tick_freeze() {
 
     let (mut genesis_config, _) = create_genesis_config(50);
     genesis_config.ticks_per_slot = 1;
-    let p = solana_pubkey::new_rand();
-    let hash = hash(p.as_ref());
+    let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    bank0.register_tick_for_test(&hash(solana_pubkey::new_rand().as_ref()));
+    let hash = hash(solana_pubkey::new_rand().as_ref());
+    let leader = SlotLeader::new_unique();
 
     for _ in 0..1000 {
-        let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
-        let bank0_ = bank0.clone();
+        let bank = Arc::new(Bank::new_from_parent(bank0.clone(), leader, 1));
+
+        // Check for race between marking bank complete and last blockhash being
+        // set.
+        let bank_ = bank.clone();
         let freeze_thread = Builder::new()
             .name("freeze".to_string())
-            .spawn(move || loop {
-                if bank0_.is_complete() {
-                    assert_eq!(bank0_.last_blockhash(), hash);
-                    break;
+            .spawn(move || {
+                loop {
+                    if bank_.is_complete() {
+                        assert_eq!(bank_.last_blockhash(), hash);
+                        break;
+                    }
                 }
             })
             .unwrap();
 
-        let bank0_ = bank0.clone();
+        // Register tick so that we trigger the freezing process.
+        let bank_ = bank.clone();
         let register_tick_thread = Builder::new()
             .name("register_tick".to_string())
             .spawn(move || {
-                bank0_.register_tick_for_test(&hash);
+                bank_.register_tick_for_test(&hash);
             })
             .unwrap();
 
@@ -264,7 +266,8 @@ impl Bank {
 #[test]
 fn test_bank_unix_timestamp_from_genesis() {
     let (genesis_config, _mint_keypair) = create_genesis_config(1);
-    let mut bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (mut bank, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     assert_eq!(
         genesis_config.creation_time,
@@ -281,6 +284,7 @@ fn test_bank_unix_timestamp_from_genesis() {
     assert!(bank.unix_timestamp_from_genesis() - genesis_config.creation_time >= 1);
 }
 
+#[allow(deprecated)]
 #[test]
 fn test_bank_new() {
     let dummy_leader_pubkey = solana_pubkey::new_rand();
@@ -298,24 +302,25 @@ fn test_bank_new() {
     );
 
     genesis_config.rent = Rent {
-        lamports_per_byte_year: 5,
-        exemption_threshold: 1.2,
-        burn_percent: 5,
+        lamports_per_byte: 5,
+        exemption_threshold: 1.2f64.to_le_bytes(),
+        ..Rent::default()
     };
 
     let bank = Bank::new_for_tests(&genesis_config);
     assert_eq!(bank.get_balance(&mint_keypair.pubkey()), mint_lamports);
+    // Vote account balance is enforced to minimum_vote_account_balance_for_vat(100) for VAT filtering
     assert_eq!(
         bank.get_balance(&voting_keypair.pubkey()),
-        dummy_leader_stake_lamports /* 1 token goes to the vote account associated with dummy_leader_lamports */
+        minimum_vote_account_balance_for_vat(100)
     );
 
     let rent_account = bank.get_account(&sysvar::rent::id()).unwrap();
     let rent = from_account::<sysvar::rent::Rent, _>(&rent_account).unwrap();
 
-    assert_eq!(rent.burn_percent, 5);
-    assert_eq!(rent.exemption_threshold, 1.0);
-    assert_eq!(rent.lamports_per_byte_year, 6);
+    assert_eq!(rent.burn_percent, Rent::default().burn_percent);
+    assert_eq!(rent.exemption_threshold, 1.0f64.to_le_bytes());
+    assert_eq!(rent.lamports_per_byte, 6);
 }
 
 pub(crate) fn create_simple_test_bank(lamports: u64) -> Bank {
@@ -415,7 +420,7 @@ fn bank2_sysvar_delta() -> u64 {
 
 #[test]
 fn test_bank_capitalization() {
-    let bank0 = Arc::new(Bank::new_for_tests(&GenesisConfig {
+    let (bank0, _bank_forks) = Bank::new_for_tests(&GenesisConfig {
         accounts: (0..42)
             .map(|_| {
                 (
@@ -426,7 +431,8 @@ fn test_bank_capitalization() {
             .collect(),
         cluster_type: ClusterType::MainnetBeta,
         ..GenesisConfig::default()
-    }));
+    })
+    .wrap_with_bank_forks_for_tests();
 
     assert_eq!(
         bank0.capitalization(),
@@ -440,7 +446,7 @@ fn test_bank_capitalization() {
         42 * 42 + genesis_sysvar_and_builtin_program_lamports() + bank0_sysvar_delta(),
     );
 
-    let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+    let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
     assert_eq!(
         bank1.capitalization(),
         42 * 42
@@ -610,7 +616,7 @@ pub(in crate::bank) fn new_from_parent_next_epoch(
         epoch = parent.epoch_schedule().get_epoch(slot);
     }
 
-    Bank::new_from_parent_with_bank_forks(bank_forks, parent, &Pubkey::default(), slot)
+    Bank::new_from_parent_with_bank_forks(bank_forks, parent, SlotLeader::default(), slot)
 }
 
 #[test]
@@ -728,7 +734,7 @@ where
     agave_logger::setup();
 
     // create a bank that ticks really slowly...
-    let bank0 = Arc::new(Bank::new_for_tests(&GenesisConfig {
+    let bank0 = Bank::new_for_tests(&GenesisConfig {
         accounts: (0..42)
             .map(|_| {
                 (
@@ -748,7 +754,8 @@ where
         cluster_type: ClusterType::MainnetBeta,
 
         ..GenesisConfig::default()
-    }));
+    });
+    let (bank0, _bank_forks) = bank0.wrap_with_bank_forks_for_tests();
 
     assert_eq!(
         bank0.capitalization(),
@@ -756,8 +763,13 @@ where
     );
 
     let ((vote_id, mut vote_account), (stake_id, stake_account)) =
-        crate::stakes::tests::create_staked_node_accounts(10_000);
-    let starting_vote_and_stake_balance = 10_000 + 1;
+        crate::stakes::tests::create_staked_node_accounts(10_000, &bank0.rent_collector.rent);
+    let starting_vote_and_stake_balance = 10_000
+        + 1
+        + bank0
+            .rent_collector
+            .rent
+            .minimum_balance(StakeStateV2::size_of());
 
     // set up accounts
     bank0.store_account_and_update_capitalization(&stake_id, &stake_account);
@@ -795,7 +807,7 @@ where
     // put a child bank in epoch 1
     let bank1 = Arc::new(Bank::new_from_parent(
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         bank0.get_slots_in_epoch(bank0.epoch()) + 1,
     ));
 
@@ -820,7 +832,7 @@ where
     // advance past partitioned epoch staking rewards delivery
     let bank2 = Arc::new(Bank::new_from_parent(
         bank1.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         bank1.slot() + 1,
     ));
     // verify that there's inflation
@@ -875,7 +887,7 @@ where
 
 fn do_test_bank_update_rewards_determinism() -> u64 {
     // create a bank that ticks really slowly...
-    let bank = Arc::new(Bank::new_for_tests(&GenesisConfig {
+    let (bank, _bank_forks) = Bank::new_for_tests(&GenesisConfig {
         accounts: (0..42)
             .map(|_| {
                 (
@@ -895,7 +907,8 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
         cluster_type: ClusterType::MainnetBeta,
 
         ..GenesisConfig::default()
-    }));
+    })
+    .wrap_with_bank_forks_for_tests();
 
     assert_eq!(
         bank.capitalization(),
@@ -916,9 +929,19 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
         100,
     );
     let stake_id1 = solana_pubkey::new_rand();
-    let stake_account1 = crate::stakes::tests::create_stake_account(123, &vote_id, &stake_id1);
+    let stake_account1 = crate::stakes::tests::create_stake_account(
+        123,
+        &vote_id,
+        &stake_id1,
+        &bank.rent_collector.rent,
+    );
     let stake_id2 = solana_pubkey::new_rand();
-    let stake_account2 = crate::stakes::tests::create_stake_account(456, &vote_id, &stake_id2);
+    let stake_account2 = crate::stakes::tests::create_stake_account(
+        456,
+        &vote_id,
+        &stake_id2,
+        &bank.rent_collector.rent,
+    );
 
     // set up accounts
     bank.store_account_and_update_capitalization(&stake_id1, &stake_account1);
@@ -945,7 +968,7 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
     // put a child bank in epoch 1, which calls update_rewards()...
     let bank1 = Arc::new(Bank::new_from_parent(
         bank.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         bank.get_slots_in_epoch(bank.epoch()) + 1,
     ));
     // verify that there's inflation
@@ -968,7 +991,7 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
 
     // put another child bank, since partitioned staking rewards are delivered
     // after the epoch-boundary slot
-    let bank2 = Bank::new_from_parent(bank1.clone(), &Pubkey::default(), bank1.slot() + 1);
+    let bank2 = Bank::new_from_parent(bank1.clone(), SlotLeader::default(), bank1.slot() + 1);
     let rewards = bank2.rewards.read().unwrap();
     rewards
         .iter()
@@ -1295,7 +1318,7 @@ fn test_executed_transaction_count_post_bank_transaction_count_fix() {
     let bank2 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank,
-        &Pubkey::default(),
+        SlotLeader::default(),
         genesis_config.epoch_schedule.first_normal_slot,
     );
 
@@ -1376,7 +1399,7 @@ fn test_bank_withdraw() {
 #[test]
 fn test_bank_withdraw_from_nonce_account() {
     let (mut genesis_config, _mint_keypair) = create_genesis_config(100_000);
-    genesis_config.rent.lamports_per_byte_year = 42;
+    genesis_config.rent.lamports_per_byte = 42;
     let bank = Bank::new_for_tests(&genesis_config);
 
     let min_balance = bank.get_minimum_balance_for_rent_exemption(nonce::state::State::size());
@@ -1416,12 +1439,12 @@ fn test_bank_tx_fee() {
 
     let arbitrary_transfer_amount = 42_000;
     let mint = arbitrary_transfer_amount * 100;
-    let leader = solana_pubkey::new_rand();
+    let leader = SlotLeader::new_unique();
     let GenesisConfigInfo {
         mut genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config_with_leader(mint, &leader, 3);
+    } = create_genesis_config_with_leader(mint, &leader.id, 3);
     genesis_config.fee_rate_governor = FeeRateGovernor::new(5000, 0); // something divisible by 2
 
     let expected_fee_paid = genesis_config
@@ -1443,7 +1466,7 @@ fn test_bank_tx_fee() {
         bank.last_blockhash(),
     );
 
-    let initial_balance = bank.get_balance(&leader);
+    let initial_balance = bank.get_balance(&leader.id);
     assert_eq!(bank.process_transaction(&tx), Ok(()));
     assert_eq!(bank.get_balance(&key), arbitrary_transfer_amount);
     assert_eq!(
@@ -1451,11 +1474,11 @@ fn test_bank_tx_fee() {
         mint - arbitrary_transfer_amount - expected_fee_paid
     );
 
-    assert_eq!(bank.get_balance(&leader), initial_balance);
+    assert_eq!(bank.get_balance(&leader.id), initial_balance);
     goto_end_of_slot(bank.clone());
     assert_eq!(bank.signature_count(), 1);
     assert_eq!(
-        bank.get_balance(&leader),
+        bank.get_balance(&leader.id),
         initial_balance + expected_fee_collected
     ); // Leader collects fee after the bank is frozen
 
@@ -1469,7 +1492,7 @@ fn test_bank_tx_fee() {
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader,
+            leader.id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1480,7 +1503,7 @@ fn test_bank_tx_fee() {
     );
 
     // Verify that an InstructionError collects fees, too
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 1);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, 1);
     let mut tx = system_transaction::transfer(&mint_keypair, &key, 1, bank.last_blockhash());
     // Create a bogus instruction to system_program to cause an instruction error
     tx.message.instructions[0].data[0] = 40;
@@ -1497,14 +1520,14 @@ fn test_bank_tx_fee() {
 
     // Profit! 2 transaction signatures processed at 3 lamports each
     assert_eq!(
-        bank.get_balance(&leader),
+        bank.get_balance(&leader.id),
         initial_balance + 2 * expected_fee_collected
     );
 
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader,
+            leader.id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1522,12 +1545,12 @@ fn test_bank_tx_compute_unit_fee() {
     let key = solana_pubkey::new_rand();
     let arbitrary_transfer_amount = 42;
     let mint = arbitrary_transfer_amount * 10_000_000;
-    let leader = solana_pubkey::new_rand();
+    let leader = SlotLeader::new_unique();
     let GenesisConfigInfo {
         mut genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config_with_leader(mint, &leader, 3);
+    } = create_genesis_config_with_leader(mint, &leader.id, 3);
     genesis_config.fee_rate_governor = FeeRateGovernor::new(4, 0); // something divisible by 2
 
     let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
@@ -1553,7 +1576,7 @@ fn test_bank_tx_compute_unit_fee() {
         bank.last_blockhash(),
     );
 
-    let initial_balance = bank.get_balance(&leader);
+    let initial_balance = bank.get_balance(&leader.id);
     assert_eq!(bank.process_transaction(&tx), Ok(()));
     assert_eq!(bank.get_balance(&key), arbitrary_transfer_amount);
     assert_eq!(
@@ -1561,11 +1584,11 @@ fn test_bank_tx_compute_unit_fee() {
         mint - arbitrary_transfer_amount - expected_fee_paid
     );
 
-    assert_eq!(bank.get_balance(&leader), initial_balance);
+    assert_eq!(bank.get_balance(&leader.id), initial_balance);
     goto_end_of_slot(bank.clone());
     assert_eq!(bank.signature_count(), 1);
     assert_eq!(
-        bank.get_balance(&leader),
+        bank.get_balance(&leader.id),
         initial_balance + expected_fee_collected
     ); // Leader collects fee after the bank is frozen
 
@@ -1579,7 +1602,7 @@ fn test_bank_tx_compute_unit_fee() {
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader,
+            leader.id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1590,7 +1613,7 @@ fn test_bank_tx_compute_unit_fee() {
     );
 
     // Verify that an InstructionError collects fees, too
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 1);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, 1);
     let mut tx = system_transaction::transfer(&mint_keypair, &key, 1, bank.last_blockhash());
     // Create a bogus instruction to system_program to cause an instruction error
     tx.message.instructions[0].data[0] = 40;
@@ -1607,14 +1630,14 @@ fn test_bank_tx_compute_unit_fee() {
 
     // Profit! 2 transaction signatures processed at 3 lamports each
     assert_eq!(
-        bank.get_balance(&leader),
+        bank.get_balance(&leader.id),
         initial_balance + 2 * expected_fee_collected
     );
 
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader,
+            leader.id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1622,130 +1645,6 @@ fn test_bank_tx_compute_unit_fee() {
                 commission_bps: None,
             }
         )]
-    );
-}
-
-#[test]
-fn test_bank_blockhash_fee_structure() {
-    //agave_logger::setup();
-
-    let leader = solana_pubkey::new_rand();
-    let GenesisConfigInfo {
-        mut genesis_config,
-        mint_keypair,
-        ..
-    } = create_genesis_config_with_leader(1_000_000, &leader, 3);
-    genesis_config
-        .fee_rate_governor
-        .target_lamports_per_signature = 5000;
-    genesis_config.fee_rate_governor.target_signatures_per_slot = 0;
-
-    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-    goto_end_of_slot(bank.clone());
-    let cheap_blockhash = bank.last_blockhash();
-    let cheap_lamports_per_signature = bank.get_lamports_per_signature();
-    assert_eq!(cheap_lamports_per_signature, 0);
-
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 1);
-    goto_end_of_slot(bank.clone());
-    let expensive_blockhash = bank.last_blockhash();
-    let expensive_lamports_per_signature = bank.get_lamports_per_signature();
-    assert!(cheap_lamports_per_signature < expensive_lamports_per_signature);
-
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 2);
-
-    // Send a transfer using cheap_blockhash
-    let key = solana_pubkey::new_rand();
-    let initial_mint_balance = bank.get_balance(&mint_keypair.pubkey());
-    let tx = system_transaction::transfer(&mint_keypair, &key, 1, cheap_blockhash);
-    assert_eq!(bank.process_transaction(&tx), Ok(()));
-    assert_eq!(bank.get_balance(&key), 1);
-    let cheap_fee = calculate_test_fee(
-        &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
-        cheap_lamports_per_signature,
-        bank.fee_structure(),
-    );
-    assert_eq!(
-        bank.get_balance(&mint_keypair.pubkey()),
-        initial_mint_balance - 1 - cheap_fee
-    );
-
-    // Send a transfer using expensive_blockhash
-    let key = solana_pubkey::new_rand();
-    let initial_mint_balance = bank.get_balance(&mint_keypair.pubkey());
-    let tx = system_transaction::transfer(&mint_keypair, &key, 1, expensive_blockhash);
-    assert_eq!(bank.process_transaction(&tx), Ok(()));
-    assert_eq!(bank.get_balance(&key), 1);
-    let expensive_fee = calculate_test_fee(
-        &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
-        expensive_lamports_per_signature,
-        bank.fee_structure(),
-    );
-    assert_eq!(
-        bank.get_balance(&mint_keypair.pubkey()),
-        initial_mint_balance - 1 - expensive_fee
-    );
-}
-
-#[test]
-fn test_bank_blockhash_compute_unit_fee_structure() {
-    //agave_logger::setup();
-
-    let leader = solana_pubkey::new_rand();
-    let GenesisConfigInfo {
-        mut genesis_config,
-        mint_keypair,
-        ..
-    } = create_genesis_config_with_leader(1_000_000_000, &leader, 3);
-    genesis_config
-        .fee_rate_governor
-        .target_lamports_per_signature = 1000;
-    genesis_config.fee_rate_governor.target_signatures_per_slot = 1;
-
-    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-    goto_end_of_slot(bank.clone());
-    let cheap_blockhash = bank.last_blockhash();
-    let cheap_lamports_per_signature = bank.get_lamports_per_signature();
-    assert_eq!(cheap_lamports_per_signature, 0);
-
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 1);
-    goto_end_of_slot(bank.clone());
-    let expensive_blockhash = bank.last_blockhash();
-    let expensive_lamports_per_signature = bank.get_lamports_per_signature();
-    assert!(cheap_lamports_per_signature < expensive_lamports_per_signature);
-
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &leader, 2);
-
-    // Send a transfer using cheap_blockhash
-    let key = solana_pubkey::new_rand();
-    let initial_mint_balance = bank.get_balance(&mint_keypair.pubkey());
-    let tx = system_transaction::transfer(&mint_keypair, &key, 1, cheap_blockhash);
-    assert_eq!(bank.process_transaction(&tx), Ok(()));
-    assert_eq!(bank.get_balance(&key), 1);
-    let cheap_fee = calculate_test_fee(
-        &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
-        cheap_lamports_per_signature,
-        bank.fee_structure(),
-    );
-    assert_eq!(
-        bank.get_balance(&mint_keypair.pubkey()),
-        initial_mint_balance - 1 - cheap_fee
-    );
-
-    // Send a transfer using expensive_blockhash
-    let key = solana_pubkey::new_rand();
-    let initial_mint_balance = bank.get_balance(&mint_keypair.pubkey());
-    let tx = system_transaction::transfer(&mint_keypair, &key, 1, expensive_blockhash);
-    assert_eq!(bank.process_transaction(&tx), Ok(()));
-    assert_eq!(bank.get_balance(&key), 1);
-    let expensive_fee = calculate_test_fee(
-        &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
-        expensive_lamports_per_signature,
-        bank.fee_structure(),
-    );
-    assert_eq!(
-        bank.get_balance(&mint_keypair.pubkey()),
-        initial_mint_balance - 1 - expensive_fee
     );
 }
 
@@ -1789,9 +1688,9 @@ fn test_readonly_accounts(relax_intrabatch_account_locks: bool) {
         bank.deactivate_feature(&feature_set::relax_intrabatch_account_locks::id());
     }
 
-    let next_slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), next_slot);
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+    let next_slot = bank.slot() + 1;
+    let bank = Bank::new_from_parent(bank, SlotLeader::default(), next_slot);
 
     let vote_pubkey0 = solana_pubkey::new_rand();
     let vote_pubkey1 = solana_pubkey::new_rand();
@@ -1914,7 +1813,6 @@ fn test_interleaving_locks() {
     let commit_results = bank
         .load_execute_and_commit_transactions(
             &lock_result,
-            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(false),
             &mut ExecuteTimings::default(),
             None,
@@ -1936,9 +1834,10 @@ fn test_interleaving_locks() {
 
     drop(lock_result);
 
-    assert!(bank
-        .transfer(2 * amount, &mint_keypair, &bob.pubkey())
-        .is_ok());
+    assert!(
+        bank.transfer(2 * amount, &mint_keypair, &bob.pubkey())
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1951,7 +1850,7 @@ fn test_load_and_execute_commit_transactions_fees_only() {
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let bank = Bank::new_from_parent(
         bank,
-        &Pubkey::new_unique(),
+        SlotLeader::new_unique(),
         genesis_config.epoch_schedule.get_first_slot_in_epoch(1),
     );
 
@@ -1994,7 +1893,6 @@ fn test_load_and_execute_commit_transactions_fees_only() {
     let commit_results = bank
         .load_execute_and_commit_transactions(
             &batch,
-            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(true),
             &mut ExecuteTimings::default(),
             None,
@@ -2029,7 +1927,7 @@ fn test_load_and_execute_commit_transactions_failure() {
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let bank = Bank::new_from_parent(
         bank,
-        &Pubkey::new_unique(),
+        SlotLeader::new_unique(),
         genesis_config.epoch_schedule.get_first_slot_in_epoch(1),
     );
 
@@ -2060,7 +1958,6 @@ fn test_load_and_execute_commit_transactions_failure() {
     let commit_results = bank
         .load_execute_and_commit_transactions(
             &batch,
-            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(true),
             &mut ExecuteTimings::default(),
             None,
@@ -2104,7 +2001,7 @@ fn test_load_and_execute_commit_transactions_success() {
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let bank = Bank::new_from_parent(
         bank,
-        &Pubkey::new_unique(),
+        SlotLeader::new_unique(),
         genesis_config.epoch_schedule.get_first_slot_in_epoch(1),
     );
 
@@ -2134,7 +2031,6 @@ fn test_load_and_execute_commit_transactions_success() {
     let commit_results = bank
         .load_execute_and_commit_transactions(
             &batch,
-            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(true),
             &mut ExecuteTimings::default(),
             None,
@@ -2268,20 +2164,20 @@ fn test_bank_pay_to_self() {
 
 fn new_from_parent(parent: Arc<Bank>) -> Bank {
     let slot = parent.slot() + 1;
-    let leader_id = Pubkey::default();
-    Bank::new_from_parent(parent, &leader_id, slot)
+    Bank::new_from_parent(parent, SlotLeader::default(), slot)
 }
 
 fn new_from_parent_with_fork_next_slot(parent: Arc<Bank>, fork: &RwLock<BankForks>) -> Arc<Bank> {
     let slot = parent.slot() + 1;
-    Bank::new_from_parent_with_bank_forks(fork, parent, &Pubkey::default(), slot)
+    Bank::new_from_parent_with_bank_forks(fork, parent, SlotLeader::default(), slot)
 }
 
 /// Verify that the parent's vector is computed correctly
 #[test]
 fn test_bank_parents() {
     let (genesis_config, _) = create_genesis_config(1);
-    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (parent, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     let bank = new_from_parent(parent.clone());
     assert!(Arc::ptr_eq(&bank.parents()[0], &parent));
@@ -2405,7 +2301,7 @@ fn test_bank_hash_internal_state_verify() {
         let bank2 = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank0.clone(),
-            &solana_pubkey::new_rand(),
+            SlotLeader::new_unique(),
             2,
         );
         assert_ne!(bank0_state, bank2.hash_internal_state());
@@ -2425,7 +2321,7 @@ fn test_bank_hash_internal_state_verify() {
         let bank3 = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank0.clone(),
-            &solana_pubkey::new_rand(),
+            SlotLeader::new_unique(),
             3,
         );
         assert_eq!(bank0_state, bank0.hash_internal_state());
@@ -2511,7 +2407,7 @@ fn test_bank_hash_same_transactions_different_fork() {
     let bank1 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         1,
     );
     bank1.transfer(amount, &mint_keypair, &pubkey).unwrap();
@@ -2520,7 +2416,7 @@ fn test_bank_hash_same_transactions_different_fork() {
     let bank2 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         2,
     );
     bank2.transfer(amount, &mint_keypair, &pubkey).unwrap();
@@ -2572,9 +2468,10 @@ fn test_hash_internal_state_error() {
     let orig = bank.hash_internal_state();
 
     // Transfer will error but still take a fee
-    assert!(bank
-        .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key0)
-        .is_err());
+    assert!(
+        bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &key0)
+            .is_err()
+    );
     assert_ne!(orig, bank.hash_internal_state());
 
     let orig = bank.hash_internal_state();
@@ -2585,13 +2482,13 @@ fn test_hash_internal_state_error() {
 
 #[test]
 fn test_bank_hash_internal_state_squash() {
-    let leader_id = Pubkey::default();
-    let bank0 = Arc::new(Bank::new_for_tests(&create_genesis_config(10).0));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&create_genesis_config(10).0).wrap_with_bank_forks_for_tests();
     let hash0 = bank0.hash_internal_state();
     // save hash0 because new_from_parent
     // updates sysvar entries
 
-    let bank1 = Bank::new_from_parent(bank0, &leader_id, 1);
+    let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
 
     // no delta in bank1, hashes should always update
     assert_ne!(hash0, bank1.hash_internal_state());
@@ -2708,7 +2605,7 @@ fn test_bank_get_account_in_parent_after_squash2() {
     let bank1 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         1,
     );
     bank1
@@ -2717,7 +2614,7 @@ fn test_bank_get_account_in_parent_after_squash2() {
     let bank2 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         2,
     );
     bank2
@@ -2727,15 +2624,12 @@ fn test_bank_get_account_in_parent_after_squash2() {
     let bank3 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank1.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         3,
     );
     bank1.squash();
 
-    // This picks up the values from 1 which is the highest root:
-    // TODO: if we need to access rooted banks older than this,
-    // need to fix the lookup.
-    assert_eq!(bank0.get_balance(&key1.pubkey()), 4 * amount);
+    assert_eq!(bank0.get_balance(&key1.pubkey()), amount);
     assert_eq!(bank3.get_balance(&key1.pubkey()), 4 * amount);
     assert_eq!(bank2.get_balance(&key1.pubkey()), 3 * amount);
     bank3.squash();
@@ -2744,7 +2638,7 @@ fn test_bank_get_account_in_parent_after_squash2() {
     let bank4 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank3.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         4,
     );
     bank4
@@ -2756,20 +2650,16 @@ fn test_bank_get_account_in_parent_after_squash2() {
     let bank5 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank4.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         5,
     );
     bank5.squash();
     let bank6 =
-        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank5, &Pubkey::default(), 6);
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank5, SlotLeader::default(), 6);
     bank6.squash();
 
-    // This picks up the values from 4 which is the highest root:
-    // TODO: if we need to access rooted banks older than this,
-    // need to fix the lookup.
-    assert_eq!(bank3.get_balance(&key1.pubkey()), 8 * amount);
-    assert_eq!(bank2.get_balance(&key1.pubkey()), 8 * amount);
-
+    assert_eq!(bank3.get_balance(&key1.pubkey()), 4 * amount);
+    assert_eq!(bank2.get_balance(&key1.pubkey()), 3 * amount);
     assert_eq!(bank4.get_balance(&key1.pubkey()), 8 * amount);
 }
 
@@ -2790,12 +2680,14 @@ fn test_bank_get_account_modified_since_parent_with_fixed_root() {
     let bank2 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank1.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         1,
     );
-    assert!(bank2
-        .get_account_modified_since_parent_with_fixed_root(&pubkey)
-        .is_none());
+    assert!(
+        bank2
+            .get_account_modified_since_parent_with_fixed_root(&pubkey)
+            .is_none()
+    );
     bank2.transfer(2 * amount, &mint_keypair, &pubkey).unwrap();
     let result = bank1.get_account_modified_since_parent_with_fixed_root(&pubkey);
     assert!(result.is_some());
@@ -2811,7 +2703,7 @@ fn test_bank_get_account_modified_since_parent_with_fixed_root() {
     bank1.squash();
 
     let bank3 =
-        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, &Pubkey::default(), 3);
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, SlotLeader::default(), 3);
     assert_eq!(
         None,
         bank3.get_account_modified_since_parent_with_fixed_root(&pubkey)
@@ -2836,7 +2728,8 @@ fn test_bank_update_sysvar_account() {
         for feature_id in FeatureSet::default().inactive() {
             activate_feature(&mut genesis_config, *feature_id);
         }
-        let bank1 = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (bank1, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
         if pass == 0 {
             add_root_and_flush_write_cache(&bank1);
             assert_eq!(
@@ -2907,7 +2800,12 @@ fn test_bank_update_sysvar_account() {
         }
 
         // Updating should increment the clock's slot
-        let bank2 = Arc::new(Bank::new_from_parent(bank1.clone(), &Pubkey::default(), 1));
+        let bank2 = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank1.clone(),
+            SlotLeader::default(),
+            1,
+        );
         add_root_and_flush_write_cache(&bank1);
         assert_capitalization_diff(
             &bank2,
@@ -2980,10 +2878,10 @@ fn test_bank_update_sysvar_account() {
 
 #[test]
 fn test_bank_epoch_vote_accounts() {
-    let leader_pubkey = solana_pubkey::new_rand();
+    let leader = SlotLeader::new_unique();
     let leader_lamports = 3;
     let mut genesis_config =
-        create_genesis_config_with_leader(5, &leader_pubkey, leader_lamports).genesis_config;
+        create_genesis_config_with_leader(5, &leader.id, leader_lamports).genesis_config;
 
     // set this up weird, forces future generation, odd mod(), etc.
     //  this says: "vote_accounts for epoch X should be generated at slot index 3 in epoch X-2...
@@ -2993,14 +2891,15 @@ fn test_bank_epoch_vote_accounts() {
     genesis_config.epoch_schedule =
         EpochSchedule::custom(SLOTS_PER_EPOCH, LEADER_SCHEDULE_SLOT_OFFSET, false);
 
-    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (parent, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     let mut leader_vote_stake: Vec<_> = parent
         .epoch_vote_accounts(0)
         .map(|accounts| {
             accounts
                 .iter()
                 .filter_map(|(pubkey, (stake, account))| {
-                    if account.node_pubkey() == &leader_pubkey {
+                    if account.node_pubkey() == &leader.id {
                         Some((*pubkey, *stake))
                     } else {
                         None
@@ -3043,7 +2942,7 @@ fn test_bank_epoch_vote_accounts() {
     // child crosses epoch boundary and is the first slot in the epoch
     let child = Bank::new_from_parent(
         parent.clone(),
-        &leader_pubkey,
+        leader,
         SLOTS_PER_EPOCH - (LEADER_SCHEDULE_SLOT_OFFSET % SLOTS_PER_EPOCH),
     );
 
@@ -3062,7 +2961,7 @@ fn test_bank_epoch_vote_accounts() {
     //  makes an epoch stakes snapshot at 1
     let child = Bank::new_from_parent(
         parent,
-        &leader_pubkey,
+        leader,
         SLOTS_PER_EPOCH - (LEADER_SCHEDULE_SLOT_OFFSET % SLOTS_PER_EPOCH) + 1,
     );
     assert!(child.epoch_vote_accounts(epoch).is_some());
@@ -3164,14 +3063,14 @@ fn test_bank_inherit_tx_count() {
     let bank1 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &solana_pubkey::new_rand(),
+        SlotLeader::new_unique(),
         1,
     );
     // Bank 2
     let bank2 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0.clone(),
-        &solana_pubkey::new_rand(),
+        SlotLeader::new_unique(),
         2,
     );
 
@@ -3205,7 +3104,7 @@ fn test_bank_inherit_tx_count() {
     let bank6 = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank1.clone(),
-        &solana_pubkey::new_rand(),
+        SlotLeader::new_unique(),
         3,
     );
     assert_eq!(bank1.transaction_count(), 1);
@@ -3225,7 +3124,8 @@ fn test_bank_inherit_fee_rate_governor() {
         .fee_rate_governor
         .target_lamports_per_signature = 123;
 
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     let bank1 = Arc::new(new_from_parent(bank0.clone()));
     assert_eq!(
         bank0.fee_rate_governor.target_lamports_per_signature / 2,
@@ -3247,7 +3147,7 @@ fn test_bank_vote_accounts() {
 
     let vote_accounts = bank.vote_accounts();
     assert_eq!(vote_accounts.len(), 1); // bootstrap validator has
-                                        // to have a vote account
+    // to have a vote account
 
     let vote_keypair = Keypair::new();
     let instructions = vote_instruction::create_account_with_config(
@@ -3311,19 +3211,18 @@ fn test_bank_cloned_stake_delegations() {
 
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     bank.squash();
-    let bank = Bank::new_from_parent(bank, &Pubkey::new_unique(), 1);
+    let bank = Bank::new_from_parent(bank, SlotLeader::new_unique(), 1);
 
     let stake_delegations = bank.stakes_cache.stakes().stake_delegations().clone();
     assert_eq!(stake_delegations.len(), 1); // bootstrap validator has
-                                            // to have a stake delegation
+    // to have a stake delegation
 
     let (vote_balance, stake_balance) = {
         let rent = &bank.rent_collector().rent;
         let vote_rent_exempt_reserve = rent.minimum_balance(VoteStateV4::size_of());
         let stake_rent_exempt_reserve = rent.minimum_balance(StakeStateV2::size_of());
         let minimum_delegation = stake_utils::get_minimum_delegation(
-            bank.feature_set
-                .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+            bank.feature_set.snapshot().upgrade_bpf_stake_program_to_v5,
         );
         (
             vote_rent_exempt_reserve,
@@ -3414,7 +3313,8 @@ fn test_is_delta_with_no_committables() {
 #[test]
 fn test_bank_get_program_accounts() {
     let (genesis_config, mint_keypair) = create_genesis_config(500);
-    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (parent, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     let genesis_accounts: Vec<_> = parent.get_all_accounts(false).unwrap();
     assert!(
@@ -3509,14 +3409,15 @@ fn test_get_filtered_indexed_accounts_limit_exceeded() {
     let account = AccountSharedData::new(1, limit, &program_id);
     bank.store_account(&address, &account);
 
-    assert!(bank
-        .get_filtered_indexed_accounts(
+    assert!(
+        bank.get_filtered_indexed_accounts(
             &IndexKey::ProgramId(program_id),
             |_| true,
             &ScanConfig::default(),
             Some(limit), // limit here will be exceeded, resulting in aborted scan
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -3530,10 +3431,8 @@ fn test_get_filtered_indexed_accounts() {
             ..ACCOUNTS_DB_CONFIG_FOR_TESTING
         },
     };
-    let bank = Arc::new(Bank::new_with_config_for_tests(
-        &genesis_config,
-        bank_config,
-    ));
+    let (bank, bank_forks) = Bank::new_with_config_for_tests(&genesis_config, bank_config)
+        .wrap_with_bank_forks_for_tests();
 
     let address = Pubkey::new_unique();
     let program_id = Pubkey::new_unique();
@@ -3556,7 +3455,12 @@ fn test_get_filtered_indexed_accounts() {
     // demonstrates the need for a redundant post-processing filter.
     let another_program_id = Pubkey::new_unique();
     let new_account = AccountSharedData::new(1, 0, &another_program_id);
-    let bank = Arc::new(new_from_parent(bank));
+    let bank = Bank::new_from_parent_with_bank_forks(
+        bank_forks.as_ref(),
+        bank.clone(),
+        SlotLeader::default(),
+        bank.slot() + 1,
+    );
     bank.store_account(&address, &new_account);
     let indexed_accounts = bank
         .get_filtered_indexed_accounts(
@@ -3607,7 +3511,8 @@ fn test_status_cache_ancestors() {
     let (parent, _bank_forks) = create_simple_test_arc_bank(500);
     let bank1 = Arc::new(new_from_parent(parent));
     let mut bank = bank1;
-    for _ in 0..MAX_CACHE_ENTRIES * 2 {
+    let max_root_entries = bank.status_cache.read().unwrap().max_root_entries();
+    for _ in 0..max_root_entries * 2 {
         bank = Arc::new(new_from_parent(bank));
         bank.squash();
     }
@@ -3615,7 +3520,7 @@ fn test_status_cache_ancestors() {
     let bank = new_from_parent(bank);
     assert_eq!(
         bank.status_cache_ancestors(),
-        (bank.slot() - MAX_CACHE_ENTRIES as u64..=bank.slot()).collect::<Vec<_>>()
+        (bank.slot() - max_root_entries as u64..=bank.slot()).collect::<Vec<_>>()
     );
 }
 
@@ -3638,7 +3543,7 @@ fn test_add_builtin() {
     });
 
     assert!(bank.get_account(&mock_vote_program_id()).is_none());
-    bank.add_mockup_builtin(mock_vote_program_id(), MockBuiltin::vm);
+    bank.add_mockup_builtin(mock_vote_program_id(), MockBuiltin::register);
     assert!(bank.get_account(&mock_vote_program_id()).is_some());
 
     let mock_account = Keypair::new();
@@ -3712,8 +3617,8 @@ fn test_add_duplicate_static_program() {
     );
 
     let slot = bank.slot().saturating_add(1);
-    let mut bank = Bank::new_from_parent(bank, &Pubkey::default(), slot);
-    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::vm);
+    let mut bank = Bank::new_from_parent(bank, SlotLeader::default(), slot);
+    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::register);
     let bank = bank_forks
         .write()
         .unwrap()
@@ -3758,7 +3663,7 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
         }
 
         let ((vote_id, vote_account), (stake_id, stake_account)) =
-            crate::stakes::tests::create_staked_node_accounts(1_0000);
+            crate::stakes::tests::create_staked_node_accounts(1_0000, &bank.rent_collector.rent);
         bank.capitalization
             .fetch_add(vote_account.lamports() + stake_account.lamports(), Relaxed);
         bank.store_account(&vote_id, &vote_account);
@@ -3780,12 +3685,12 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
         bank.add_builtin(
             vote_id,
             "mock_program1",
-            ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::vm),
+            ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::register),
         );
         bank.add_builtin(
             stake_id,
             "mock_program2",
-            ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::vm),
+            ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::register),
         );
         {
             let stakes = bank.stakes_cache.stakes();
@@ -3811,8 +3716,8 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
 
         // Re-adding builtin programs should be no-op
         let old_hash = bank.calculate_accounts_lt_hash_for_tests();
-        bank.add_mockup_builtin(vote_id, MockBuiltin::vm);
-        bank.add_mockup_builtin(stake_id, MockBuiltin::vm);
+        bank.add_mockup_builtin(vote_id, MockBuiltin::register);
+        bank.add_mockup_builtin(stake_id, MockBuiltin::register);
         add_root_and_flush_write_cache(&bank);
         let new_hash = bank.calculate_accounts_lt_hash_for_tests();
         assert_eq!(old_hash, new_hash);
@@ -3872,10 +3777,11 @@ fn test_blockhash_queue_sysvar_consistency() {
 #[test]
 fn test_hash_internal_state_unchanged() {
     let (genesis_config, _) = create_genesis_config(500);
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     bank0.freeze();
     let bank0_hash = bank0.hash();
-    let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+    let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
     bank1.freeze();
     let bank1_hash = bank1.hash();
     // Checkpointing should always result in a new state
@@ -3885,7 +3791,7 @@ fn test_hash_internal_state_unchanged() {
 #[test]
 fn test_hash_internal_state_unchanged_with_ticks() {
     let (genesis_config, _) = create_genesis_config(500);
-    let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank, _bank_forks) = Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     let bank1 = new_from_parent(bank);
     let hash1 = bank1.hash_internal_state();
     // ticks don't change its state even if a slot boundary is crossed
@@ -4013,16 +3919,14 @@ pub(in crate::bank) fn setup_nonce_with_bank<F>(
     custodian_lamports: u64,
     nonce_lamports: u64,
     nonce_authority: Option<Pubkey>,
-    feature_set: FeatureSet,
 ) -> Result<NonceSetup>
 where
     F: FnMut(&mut GenesisConfig),
 {
     let (mut genesis_config, mint_keypair) = create_genesis_config(supply_lamports);
-    genesis_config.rent.lamports_per_byte_year = 0;
+    genesis_config.rent.lamports_per_byte = 0;
     genesis_cfg_fn(&mut genesis_config);
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    bank.feature_set = Arc::new(feature_set);
+    let bank = Bank::new_for_tests(&genesis_config);
     let (mut bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     // Banks 0 and 1 have no fees, wait two blocks before
@@ -4119,15 +4023,7 @@ fn test_nonce_must_be_advanceable() {
 #[test]
 fn test_nonce_transaction() {
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(
-            10_000_000,
-            |_| {},
-            5_000_000,
-            250_000,
-            None,
-            FeatureSet::all_enabled(),
-        )
-        .unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, 250_000, None).unwrap();
     let alice_keypair = Keypair::new();
     let alice_pubkey = alice_keypair.pubkey();
     let custodian_pubkey = custodian_keypair.pubkey();
@@ -4252,9 +4148,8 @@ fn test_nonce_transaction() {
 
 #[test]
 fn test_nonce_transaction_with_tx_wide_caps() {
-    let feature_set = FeatureSet::all_enabled();
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, 250_000, None, feature_set).unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, 250_000, None).unwrap();
     let alice_keypair = Keypair::new();
     let alice_pubkey = alice_keypair.pubkey();
     let custodian_pubkey = custodian_keypair.pubkey();
@@ -4381,15 +4276,7 @@ fn test_nonce_transaction_with_tx_wide_caps() {
 fn test_nonce_authority() {
     agave_logger::setup();
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(
-            10_000_000,
-            |_| {},
-            5_000_000,
-            250_000,
-            None,
-            FeatureSet::all_enabled(),
-        )
-        .unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, 250_000, None).unwrap();
     let alice_keypair = Keypair::new();
     let alice_pubkey = alice_keypair.pubkey();
     let custodian_pubkey = custodian_keypair.pubkey();
@@ -4443,15 +4330,7 @@ fn test_nonce_payer() {
     agave_logger::setup();
     let nonce_starting_balance = 250_000;
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(
-            10_000_000,
-            |_| {},
-            5_000_000,
-            nonce_starting_balance,
-            None,
-            FeatureSet::all_enabled(),
-        )
-        .unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, nonce_starting_balance, None).unwrap();
     let alice_keypair = Keypair::new();
     let alice_pubkey = alice_keypair.pubkey();
     let custodian_pubkey = custodian_keypair.pubkey();
@@ -4507,17 +4386,8 @@ fn test_nonce_payer_tx_wide_cap() {
     agave_logger::setup();
     let nonce_starting_balance =
         250_000 + FeeStructure::default().compute_fee_bins.last().unwrap().fee;
-    let feature_set = FeatureSet::all_enabled();
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(
-            10_000_000,
-            |_| {},
-            5_000_000,
-            nonce_starting_balance,
-            None,
-            feature_set,
-        )
-        .unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, nonce_starting_balance, None).unwrap();
     let alice_keypair = Keypair::new();
     let alice_pubkey = alice_keypair.pubkey();
     let custodian_pubkey = custodian_keypair.pubkey();
@@ -4572,7 +4442,7 @@ fn test_nonce_payer_tx_wide_cap() {
 #[test]
 fn test_nonce_fee_calculator_updates() {
     let (mut genesis_config, mint_keypair) = create_genesis_config(1_000_000);
-    genesis_config.rent.lamports_per_byte_year = 0;
+    genesis_config.rent.lamports_per_byte = 0;
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.feature_set = Arc::new(FeatureSet::all_enabled());
     let (mut bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
@@ -4636,7 +4506,7 @@ fn test_nonce_fee_calculator_updates() {
 #[test]
 fn test_nonce_fee_calculator_updates_tx_wide_cap() {
     let (mut genesis_config, mint_keypair) = create_genesis_config(1_000_000);
-    genesis_config.rent.lamports_per_byte_year = 0;
+    genesis_config.rent.lamports_per_byte = 0;
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.feature_set = Arc::new(FeatureSet::all_enabled());
     let (mut bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
@@ -4700,15 +4570,7 @@ fn test_nonce_fee_calculator_updates_tx_wide_cap() {
 #[test]
 fn test_check_ro_durable_nonce_fails() {
     let (mut bank, _mint_keypair, custodian_keypair, nonce_keypair, bank_forks) =
-        setup_nonce_with_bank(
-            10_000_000,
-            |_| {},
-            5_000_000,
-            250_000,
-            None,
-            FeatureSet::all_enabled(),
-        )
-        .unwrap();
+        setup_nonce_with_bank(10_000_000, |_| {}, 5_000_000, 250_000, None).unwrap();
     let custodian_pubkey = custodian_keypair.pubkey();
     let nonce_pubkey = nonce_keypair.pubkey();
 
@@ -4834,7 +4696,6 @@ fn test_pre_post_transaction_balances() {
     let lock_result = bank0.prepare_batch_for_tests(txs);
     let (commit_results, balance_collector) = bank0.load_execute_and_commit_transactions(
         &lock_result,
-        MAX_PROCESSING_AGE,
         ExecutionRecordingConfig {
             enable_cpi_recording: false,
             enable_log_recording: false,
@@ -4891,8 +4752,11 @@ fn test_transaction_with_duplicate_accounts_in_instruction() {
     let (genesis_config, mint_keypair) = create_genesis_config_no_tx_fee_no_rent(500);
 
     let mock_program_id = Pubkey::from([2u8; 32]);
-    let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, mock_program_id, MockBuiltin::vm);
+    let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
+        &genesis_config,
+        mock_program_id,
+        MockBuiltin::register,
+    );
 
     declare_process_instruction!(MockBuiltin, 1, |invoke_context| {
         let transaction_context = &invoke_context.transaction_context;
@@ -4947,8 +4811,11 @@ fn test_transaction_with_program_ids_passed_to_programs() {
     let (genesis_config, mint_keypair) = create_genesis_config_no_tx_fee_no_rent(500);
 
     let mock_program_id = Pubkey::from([2u8; 32]);
-    let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, mock_program_id, MockBuiltin::vm);
+    let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
+        &genesis_config,
+        mock_program_id,
+        MockBuiltin::register,
+    );
 
     let from_pubkey = solana_pubkey::new_rand();
     let to_pubkey = solana_pubkey::new_rand();
@@ -5001,8 +4868,8 @@ fn test_account_ids_after_program_ids() {
     tx.message.account_keys.push(solana_pubkey::new_rand());
 
     let slot = bank.slot().saturating_add(1);
-    let mut bank = Bank::new_from_parent(bank, &Pubkey::default(), slot);
-    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::vm);
+    let mut bank = Bank::new_from_parent(bank, SlotLeader::default(), slot);
+    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::register);
     let bank = bank_forks
         .write()
         .unwrap()
@@ -5025,7 +4892,7 @@ fn test_incinerator() {
     let bank = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank0,
-        &Pubkey::default(),
+        SlotLeader::default(),
         genesis_config.epoch_schedule.first_normal_slot,
     );
     let pre_capitalization = bank.capitalization();
@@ -5052,7 +4919,7 @@ fn test_duplicate_account_key() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         solana_vote_program::id(),
-        MockBuiltin::vm,
+        MockBuiltin::register,
     );
 
     let from_pubkey = solana_pubkey::new_rand();
@@ -5083,7 +4950,7 @@ fn test_process_transaction_with_too_many_account_locks() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         solana_vote_program::id(),
-        MockBuiltin::vm,
+        MockBuiltin::register,
     );
 
     let from_pubkey = solana_pubkey::new_rand();
@@ -5125,7 +4992,7 @@ fn test_program_id_as_payer() {
         AccountMeta::new(to_pubkey, false),
     ];
 
-    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::vm);
+    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::register);
 
     let instruction = Instruction::new_with_bincode(solana_vote_program::id(), &10, account_metas);
     let mut tx = Transaction::new_signed_with_payer(
@@ -5169,8 +5036,8 @@ fn test_ref_account_key_after_program_id() {
     ];
 
     let slot = bank.slot().saturating_add(1);
-    let mut bank = Bank::new_from_parent(bank, &Pubkey::default(), slot);
-    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::vm);
+    let mut bank = Bank::new_from_parent(bank, SlotLeader::default(), slot);
+    bank.add_mockup_builtin(solana_vote_program::id(), MockBuiltin::register);
     let bank = bank_forks
         .write()
         .unwrap()
@@ -5197,7 +5064,7 @@ fn test_ref_account_key_after_program_id() {
 #[test]
 fn test_fuzz_instructions() {
     agave_logger::setup();
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
     let bank = create_simple_test_bank(1_000_000_000);
 
     let max_programs = 5;
@@ -5209,7 +5076,7 @@ fn test_fuzz_instructions() {
             bank.add_builtin(
                 key,
                 name.as_str(),
-                ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::vm),
+                ProgramCacheEntry::new_builtin(0, 0, MockBuiltin::register),
             );
             (key, name.as_bytes().to_vec())
         })
@@ -5359,10 +5226,11 @@ fn test_fuzz_instructions() {
 // new feature that affects the bank hash, you should update this test to use a
 // test matrix that tests the bank hash calculation with and without your
 // added feature.
+#[allow(deprecated)]
 #[test_case(false ; "legacy")]
 #[test_case(true ; "deprecate rent exemption threshold")]
 fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
-    let genesis_config = GenesisConfig {
+    let mut genesis_config = GenesisConfig {
         // Override the creation time to ensure bank hash consistency
         creation_time: 0,
         accounts: BTreeMap::from([(
@@ -5373,6 +5241,9 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
         ..GenesisConfig::default()
     };
 
+    genesis_config.rent.lamports_per_byte = DEFAULT_LAMPORTS_PER_BYTE / 2;
+    genesis_config.rent.exemption_threshold = 2.0f64.to_le_bytes();
+
     // Set the feature set to all enabled so that we detect any inconsistencies
     // in the hash computation that may arise from feature set changes
     let mut feature_set = FeatureSet::all_enabled();
@@ -5381,18 +5252,22 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
         feature_set.deactivate(&feature_set::deprecate_rent_exemption_threshold::id());
     }
 
-    let mut bank = Arc::new(Bank::new_from_genesis(
+    let (mut bank, _bank_forks) = Bank::new_from_genesis(
         &genesis_config,
         Arc::new(RuntimeConfig::default()),
         vec![],
         None,
         BankTestConfig::default().accounts_db_config,
         None,
-        Some(Pubkey::from([42; 32])),
+        Some(SlotLeader {
+            id: Pubkey::from([42; 32]),
+            vote_address: Pubkey::from([67; 32]),
+        }),
         Arc::default(),
         None,
         Some(feature_set),
-    ));
+    )
+    .wrap_with_bank_forks_for_tests();
     loop {
         goto_end_of_slot(Arc::clone(&bank));
         if bank.slot == 0 {
@@ -5412,10 +5287,10 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
             assert_eq!(
                 bank.hash().to_string(),
                 if deprecate_rent_exemption_threshold {
-                    "HvCfM9MQCvCDH4zW39G7UqKDB4PLR5GaqVSf9Jfe5XnS"
+                    "CJJZGTf9hSxCa54aw6koyLsixsVzN6vqQsRBDDmq2xPZ"
                 } else {
-                    "6h1KzSuTW6MwkgjtEbrv6AyUZ2NHtSxCQi8epjHDFYh8"
-                }
+                    "GAcpLy2beH4eyygZaprWWzn4geSCd3xvLvnn2tudvhy1"
+                },
             );
         }
         if bank.slot == 128 {
@@ -5423,10 +5298,10 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
             assert_eq!(
                 bank.hash().to_string(),
                 if deprecate_rent_exemption_threshold {
-                    "GS2G4uVus4U97woniYLW1f2BWqoZFGFrpSQXto7PnjTT"
+                    "D1fVqmYoLjX8YRDKdfxdyvjUGZJQuPkczgb45ska2MAQ"
                 } else {
-                    "4GX3883TVK7SQfbPUHem4HXcqdHU2DZVAB6yEXspn2qe"
-                }
+                    "EKG6nQZnUHiv56HpYfxGSkXpn2uo8ea9bJfR6uYvKBR1"
+                },
             );
             break;
         }
@@ -5448,8 +5323,11 @@ fn test_same_program_id_uses_unique_executable_accounts() {
 
     let (genesis_config, mint_keypair) = create_genesis_config(50000);
     let program1_pubkey = solana_pubkey::new_rand();
-    let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program1_pubkey, MockBuiltin::vm);
+    let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
+        &genesis_config,
+        program1_pubkey,
+        MockBuiltin::register,
+    );
 
     // Add a new program owned by the first
     let program2_pubkey = solana_pubkey::new_rand();
@@ -5470,82 +5348,6 @@ fn test_same_program_id_uses_unique_executable_accounts() {
 }
 
 #[test]
-fn test_clean_nonrooted() {
-    agave_logger::setup();
-
-    let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000_000);
-    let pubkey0 = Pubkey::from([0; 32]);
-    let pubkey1 = Pubkey::from([1; 32]);
-
-    info!("pubkey0: {pubkey0}");
-    info!("pubkey1: {pubkey1}");
-
-    // Set root for bank 0, with caching enabled
-    let bank0 = Arc::new(Bank::new_with_config_for_tests(
-        &genesis_config,
-        BankTestConfig::default(),
-    ));
-
-    let account_zero = AccountSharedData::new(0, 0, &Pubkey::new_unique());
-
-    goto_end_of_slot(bank0.clone());
-    bank0.freeze();
-    bank0.squash();
-    // Flush now so that accounts cache cleaning doesn't clean up bank 0 when later
-    // slots add updates to the cache
-    bank0.force_flush_accounts_cache();
-
-    // Store some lamports in bank 1
-    let some_lamports = 123;
-    let bank1 = Arc::new(Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 1));
-    test_utils::deposit(&bank1, &pubkey0, some_lamports).unwrap();
-    goto_end_of_slot(bank1.clone());
-    bank1.freeze();
-    bank1
-        .accounts()
-        .accounts_db
-        .flush_unrooted_slot_cache(bank1.slot());
-
-    bank1.print_accounts_stats();
-
-    // Store some lamports for pubkey1 in bank 2, root bank 2
-    // bank2's parent is bank0
-    let bank2 = Arc::new(Bank::new_from_parent(bank0, &Pubkey::default(), 2));
-    test_utils::deposit(&bank2, &pubkey1, some_lamports).unwrap();
-    bank2.store_account(&pubkey0, &account_zero);
-    goto_end_of_slot(bank2.clone());
-    bank2.freeze();
-    bank2.squash();
-    bank2.force_flush_accounts_cache();
-
-    bank2.print_accounts_stats();
-    drop(bank1);
-
-    // Clean accounts, which should add earlier slots to the shrink
-    // candidate set
-    bank2.clean_accounts_for_tests();
-
-    let bank3 = Arc::new(Bank::new_from_parent(bank2, &Pubkey::default(), 3));
-    test_utils::deposit(&bank3, &pubkey1, some_lamports + 1).unwrap();
-    goto_end_of_slot(bank3.clone());
-    bank3.freeze();
-    bank3.squash();
-    bank3.force_flush_accounts_cache();
-
-    bank3.clean_accounts_for_tests();
-    bank3.rc.accounts.accounts_db.assert_ref_count(&pubkey0, 2);
-    assert!(bank3
-        .rc
-        .accounts
-        .accounts_db
-        .storage
-        .get_slot_storage_entry(1)
-        .is_none());
-
-    bank3.print_accounts_stats();
-}
-
-#[test]
 fn test_shrink_candidate_slots_cached() {
     agave_logger::setup();
 
@@ -5555,10 +5357,9 @@ fn test_shrink_candidate_slots_cached() {
     let pubkey2 = solana_pubkey::new_rand();
 
     // Set root for bank 0, with caching enabled
-    let bank0 = Arc::new(Bank::new_with_config_for_tests(
-        &genesis_config,
-        BankTestConfig::default(),
-    ));
+    let (bank0, bank_forks) =
+        Bank::new_with_config_for_tests(&genesis_config, BankTestConfig::default())
+            .wrap_with_bank_forks_for_tests();
 
     // Make pubkey0 large so any slot containing it is a candidate for shrinking
     let pubkey0_size = 100_000;
@@ -5575,7 +5376,12 @@ fn test_shrink_candidate_slots_cached() {
 
     // Store some lamports in bank 1
     let some_lamports = 123;
-    let bank1 = Arc::new(new_from_parent(bank0));
+    let bank1 = Bank::new_from_parent_with_bank_forks(
+        bank_forks.as_ref(),
+        bank0.clone(),
+        SlotLeader::default(),
+        bank0.slot() + 1,
+    );
     test_utils::deposit(&bank1, &pubkey1, some_lamports).unwrap();
     test_utils::deposit(&bank1, &pubkey2, some_lamports).unwrap();
     goto_end_of_slot(bank1.clone());
@@ -5586,7 +5392,12 @@ fn test_shrink_candidate_slots_cached() {
     bank1.force_flush_accounts_cache();
 
     // Store some lamports for pubkey1 in bank 2, root bank 2
-    let bank2 = Arc::new(new_from_parent(bank1));
+    let bank2 = Bank::new_from_parent_with_bank_forks(
+        bank_forks.as_ref(),
+        bank1.clone(),
+        SlotLeader::default(),
+        bank1.slot() + 1,
+    );
     test_utils::deposit(&bank2, &pubkey1, some_lamports).unwrap();
     bank2.store_account(&pubkey0, &account0);
     goto_end_of_slot(bank2.clone());
@@ -5615,7 +5426,7 @@ fn test_shrink_candidate_slots_cached() {
     // No more slots should be shrunk
     assert_eq!(bank2.shrink_candidate_slots(), 0);
     // alive_counts represents the count of alive accounts in the three slots 0,1,2
-    assert_eq!(alive_counts, vec![12, 1, 6]);
+    assert_eq!(alive_counts, vec![14, 1, 6]);
 }
 
 #[test]
@@ -5624,18 +5435,22 @@ fn test_add_builtin_no_overwrite() {
     let program_id = solana_pubkey::new_rand();
 
     let (parent_bank, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Arc::new(Bank::new_from_parent(parent_bank, &Pubkey::default(), slot));
+    let mut bank = Arc::new(Bank::new_from_parent(
+        parent_bank,
+        SlotLeader::default(),
+        slot,
+    ));
     assert_eq!(bank.get_account_modified_slot(&program_id), None);
 
     Arc::get_mut(&mut bank)
         .unwrap()
-        .add_mockup_builtin(program_id, MockBuiltin::vm);
+        .add_mockup_builtin(program_id, MockBuiltin::register);
     assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
 
     let mut bank = Arc::new(new_from_parent(bank));
     Arc::get_mut(&mut bank)
         .unwrap()
-        .add_mockup_builtin(program_id, MockBuiltin::vm);
+        .add_mockup_builtin(program_id, MockBuiltin::register);
     assert_eq!(bank.get_account_modified_slot(&program_id).unwrap().1, slot);
 }
 
@@ -5645,18 +5460,22 @@ fn test_add_builtin_loader_no_overwrite() {
     let loader_id = solana_pubkey::new_rand();
 
     let (parent_bank, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Arc::new(Bank::new_from_parent(parent_bank, &Pubkey::default(), slot));
+    let mut bank = Arc::new(Bank::new_from_parent(
+        parent_bank,
+        SlotLeader::default(),
+        slot,
+    ));
     assert_eq!(bank.get_account_modified_slot(&loader_id), None);
 
     Arc::get_mut(&mut bank)
         .unwrap()
-        .add_mockup_builtin(loader_id, MockBuiltin::vm);
+        .add_mockup_builtin(loader_id, MockBuiltin::register);
     assert_eq!(bank.get_account_modified_slot(&loader_id).unwrap().1, slot);
 
     let mut bank = Arc::new(new_from_parent(bank));
     Arc::get_mut(&mut bank)
         .unwrap()
-        .add_mockup_builtin(loader_id, MockBuiltin::vm);
+        .add_mockup_builtin(loader_id, MockBuiltin::register);
     assert_eq!(bank.get_account_modified_slot(&loader_id).unwrap().1, slot);
 }
 
@@ -5670,11 +5489,14 @@ fn test_add_builtin_account() {
         // The account at program_id will be created initially with just 1 lamport.
         let program_id = Pubkey::new_from_array([0xFF; 32]);
 
-        let bank = Arc::new(Bank::new_from_parent(
-            Arc::new(Bank::new_for_tests(&genesis_config)),
-            &Pubkey::default(),
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let bank = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank0.clone(),
+            SlotLeader::default(),
             slot,
-        ));
+        );
         add_root_and_flush_write_cache(&bank.parent().unwrap());
         assert_eq!(bank.get_account_modified_slot(&program_id), None);
 
@@ -5829,7 +5651,7 @@ fn test_add_builtin_account_after_frozen() {
     let program_id = Pubkey::from_str("CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre").unwrap();
 
     let (parent_bank, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let bank = Bank::new_from_parent(parent_bank, &Pubkey::default(), slot);
+    let bank = Bank::new_from_parent(parent_bank, SlotLeader::default(), slot);
     bank.freeze();
 
     bank.add_builtin_account("mock_program", &program_id);
@@ -5844,11 +5666,14 @@ fn test_add_precompiled_account() {
         let slot = 123;
         let program_id = solana_pubkey::new_rand();
 
-        let bank = Arc::new(Bank::new_from_parent(
-            Arc::new(Bank::new_for_tests(&genesis_config)),
-            &Pubkey::default(),
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let bank = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank0.clone(),
+            SlotLeader::default(),
             slot,
-        ));
+        );
         add_root_and_flush_write_cache(&bank.parent().unwrap());
         assert_eq!(bank.get_account_modified_slot(&program_id), None);
 
@@ -5978,7 +5803,7 @@ fn test_add_precompiled_account_after_frozen() {
     let program_id = Pubkey::from_str("CiXgo2KHKSDmDnV1F6B69eWFgNAPiSBjjYvfB4cvRNre").unwrap();
 
     let (parent_bank, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let bank = Bank::new_from_parent(parent_bank, &Pubkey::default(), slot);
+    let bank = Bank::new_from_parent(parent_bank, SlotLeader::default(), slot);
     bank.freeze();
 
     bank.add_precompiled_account(&program_id);
@@ -6005,8 +5830,8 @@ fn test_bank_load_program() {
     let bank = Bank::new_for_tests(&genesis_config);
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
     goto_end_of_slot(bank.clone());
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 42);
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 50);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 42);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 50);
 
     let program_key = solana_pubkey::new_rand();
     let programdata_key = solana_pubkey::new_rand();
@@ -6044,11 +5869,7 @@ fn test_bank_load_program() {
     let instruction = Instruction::new_with_bytes(program_key, &[], Vec::new());
     let invocation_message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
     let binding = mint_keypair.insecure_clone();
-    let transaction = Transaction::new(
-        &[&binding],
-        invocation_message.clone(),
-        bank.last_blockhash(),
-    );
+    let transaction = Transaction::new(&[&binding], invocation_message, bank.last_blockhash());
     assert!(bank.process_transaction(&transaction).is_ok());
 
     {
@@ -6115,9 +5936,9 @@ fn test_bpf_loader_upgradeable_deploy_with_max_len() {
     // after creating the program, the new transaction created below with the
     // same `invocation_message` as above doesn't return `AlreadyProcessed` when
     // processed.
-    goto_end_of_slot(bank.clone());
+    goto_end_of_slot(bank);
     let bank = bank_client
-        .advance_slot(1, bank_forks.as_ref(), &mint_keypair.pubkey())
+        .advance_slot(1, bank_forks.as_ref(), SlotLeader::default())
         .unwrap();
 
     // Load program file
@@ -6256,12 +6077,14 @@ fn test_bpf_loader_upgradeable_deploy_with_max_len() {
         .unwrap(),
         Some(&payer_keypair.pubkey()),
     );
-    assert!(bank_client
-        .send_and_confirm_message(
-            &[&payer_keypair, &program_keypair, &upgrade_authority_keypair],
-            message
-        )
-        .is_ok());
+    assert!(
+        bank_client
+            .send_and_confirm_message(
+                &[&payer_keypair, &program_keypair, &upgrade_authority_keypair],
+                message
+            )
+            .is_ok()
+    );
     assert_eq!(
         bank.get_balance(&payer_keypair.pubkey()),
         payer_base_balance
@@ -6307,9 +6130,9 @@ fn test_bpf_loader_upgradeable_deploy_with_max_len() {
     }
 
     // Advance the bank so that the program becomes effective
-    goto_end_of_slot(bank.clone());
+    goto_end_of_slot(bank);
     let bank = bank_client
-        .advance_slot(1, bank_forks.as_ref(), &mint_keypair.pubkey())
+        .advance_slot(1, bank_forks.as_ref(), SlotLeader::default())
         .unwrap();
 
     // Invoke the deployed program
@@ -6335,7 +6158,7 @@ fn test_bpf_loader_upgradeable_deploy_with_max_len() {
     bank.clear_signatures();
     bank.store_account(&buffer_address, &buffer_account);
     let bank = bank_client
-        .advance_slot(1, bank_forks.as_ref(), &mint_keypair.pubkey())
+        .advance_slot(1, bank_forks.as_ref(), SlotLeader::default())
         .unwrap();
     let message = Message::new(
         &[Instruction::new_with_bincode(
@@ -6852,13 +6675,13 @@ fn test_bpf_loader_upgradeable_deploy_with_max_len() {
 #[test]
 fn test_compute_active_feature_set() {
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+    let mut bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
 
     let test_feature = "TestFeature11111111111111111111111111111111"
         .parse::<Pubkey>()
         .unwrap();
     let mut feature_set = FeatureSet::default();
-    feature_set.inactive_mut().insert(test_feature);
+    feature_set.deactivate(&test_feature);
     bank.feature_set = Arc::new(feature_set.clone());
 
     let (feature_set, new_activations) = bank.compute_active_feature_set(true);
@@ -6903,7 +6726,7 @@ fn test_compute_active_feature_set() {
 #[test]
 fn test_reserved_account_keys() {
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+    let mut bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
     let test_feature_id = Pubkey::new_unique();
     bank.feature_set = Arc::new(FeatureSet::new(
         AHashMap::new(),
@@ -6935,23 +6758,17 @@ fn test_reserved_account_keys() {
 
 #[test]
 fn test_block_limits() {
-    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_FIRST: u64 = 24_000_000;
-    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND: u64 = 40_000_000;
+    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_ENABLED: u64 = 40_000_000;
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+    let mut bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
 
     // Ensure increased block limits features are inactive.
-    assert!(!bank
-        .feature_set
-        .is_active(&feature_set::raise_block_limits_to_100m::id()));
+    assert!(!bank.feature_set.snapshot().raise_block_limits_to_100m);
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS,
         "before activating the feature, bank should have old/default limit"
     );
-    assert!(!bank
-        .feature_set
-        .is_active(&feature_set::raise_account_cu_limit::id()));
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_account_limit(),
         MAX_WRITABLE_ACCOUNT_UNITS,
@@ -6980,93 +6797,20 @@ fn test_block_limits() {
     );
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS,
+        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_ENABLED,
         "after activating the feature, bank should have new limit"
     );
 
     // Make sure the limits propagate to the child-bank.
-    let mut bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), 2);
+    let bank = Bank::new_from_parent(Arc::new(bank), SlotLeader::default(), 2);
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS_SIMD_0286,
         "child bank should have new limit"
     );
-
-    // Activate `raise_account_cu_limit` feature
-    bank.store_account(
-        &feature_set::raise_account_cu_limit::id(),
-        &feature::create_account(&Feature::default(), 42),
-    );
-
-    // compute_and_apply_features_after_snapshot_restore will not cause the block limit to be updated
-    bank.compute_and_apply_features_after_snapshot_restore();
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS,
-        "before activating the feature, bank should have old/default limit"
-    );
-
-    // compute_and_apply_new_feature_activations will cause feature to be activated
-    bank.compute_and_apply_new_feature_activations();
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND,
-        "after activating the feature, bank should have new limit"
-    );
-
-    // Test SIMD-0306 getting activated first
-    let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
-    let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
-
-    // Activate `raise_account_cu_limit` feature
-    bank.store_account(
-        &feature_set::raise_account_cu_limit::id(),
-        &feature::create_account(&Feature::default(), 42),
-    );
-    // compute_and_apply_features_after_snapshot_restore will not cause the block limit to be updated
-    bank.compute_and_apply_features_after_snapshot_restore();
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS,
-        "before activating the feature, bank should have old/default limit"
-    );
-
-    // compute_and_apply_new_feature_activations will cause feature to be activated
-    bank.compute_and_apply_new_feature_activations();
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_block_limit(),
-        MAX_BLOCK_UNITS,
-        "after activating the feature, bank should have new limit"
-    );
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_FIRST,
-        "after activating the feature, bank should have new limit"
-    );
-
-    // Activate `raise_block_limits_to_100m` feature
-    bank.store_account(
-        &feature_set::raise_block_limits_to_100m::id(),
-        &feature::create_account(&Feature::default(), 42),
-    );
-    // compute_and_apply_features_after_snapshot_restore will not cause the block limit to be updated
-    bank.compute_and_apply_features_after_snapshot_restore();
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_block_limit(),
-        MAX_BLOCK_UNITS,
-        "before activating the feature, bank should have old/default limit"
-    );
-
-    // compute_and_apply_new_feature_activations will cause feature to be activated
-    bank.compute_and_apply_new_feature_activations();
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_block_limit(),
-        MAX_BLOCK_UNITS_SIMD_0286,
-        "after activating the feature, bank should have new limit"
-    );
-    assert_eq!(
-        bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND,
+        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_ENABLED,
         "after activating the feature, bank should have new limit"
     );
 
@@ -7090,27 +6834,145 @@ fn test_block_limits() {
         feature_set::raise_block_limits_to_100m::id(),
     );
     let bank = Bank::new_for_tests(&genesis_config);
-    assert!(bank
-        .feature_set
-        .is_active(&feature_set::raise_block_limits_to_100m::id()));
+    assert!(bank.feature_set.snapshot().raise_block_limits_to_100m);
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_block_limit(),
         MAX_BLOCK_UNITS_SIMD_0286,
         "bank created from genesis config should have new limit"
     );
 
-    activate_feature(
-        &mut genesis_config,
-        feature_set::raise_account_cu_limit::id(),
-    );
     let bank = Bank::new_for_tests(&genesis_config);
-    assert!(bank
-        .feature_set
-        .is_active(&feature_set::raise_account_cu_limit::id()));
     assert_eq!(
         bank.read_cost_tracker().unwrap().get_account_limit(),
-        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND,
+        MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_ENABLED,
         "bank created from genesis config should have new limit"
+    );
+}
+
+#[test]
+fn test_simd_0437_rent_feature_gates_epoch_transition() {
+    let (mut genesis_config, _mint_keypair) = create_genesis_config(1_000_000);
+    genesis_config.rent.lamports_per_byte = 0;
+    let (mut bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    let rent_feature_gates = [
+        (
+            feature_set::set_lamports_per_byte_to_6333::id(),
+            feature_set::set_lamports_per_byte_to_6333::LAMPORTS_PER_BYTE,
+        ),
+        (
+            feature_set::set_lamports_per_byte_to_5080::id(),
+            feature_set::set_lamports_per_byte_to_5080::LAMPORTS_PER_BYTE,
+        ),
+        (
+            feature_set::set_lamports_per_byte_to_2575::id(),
+            feature_set::set_lamports_per_byte_to_2575::LAMPORTS_PER_BYTE,
+        ),
+        (
+            feature_set::set_lamports_per_byte_to_1322::id(),
+            feature_set::set_lamports_per_byte_to_1322::LAMPORTS_PER_BYTE,
+        ),
+        (
+            feature_set::set_lamports_per_byte_to_696::id(),
+            feature_set::set_lamports_per_byte_to_696::LAMPORTS_PER_BYTE,
+        ),
+    ];
+    let feature_account_balance =
+        std::cmp::max(genesis_config.rent.minimum_balance(Feature::size_of()), 1);
+
+    for (feature_id, expected_lamports_per_byte) in rent_feature_gates {
+        assert!(
+            !bank.feature_set.is_active(&feature_id),
+            "feature should be inactive before activation"
+        );
+        bank.store_account(
+            &feature_id,
+            &feature::create_account(&Feature { activated_at: None }, feature_account_balance),
+        );
+
+        // Cross the epoch boundary to apply feature activation.
+        goto_end_of_slot(bank.clone());
+        bank = new_from_parent_next_epoch(bank, &bank_forks, 1);
+
+        assert!(
+            bank.feature_set.is_active(&feature_id),
+            "feature should be active after epoch transition"
+        );
+        assert_eq!(
+            bank.rent_collector.rent.lamports_per_byte, expected_lamports_per_byte,
+            "rent collector should reflect the active gate"
+        );
+
+        let rent_account = bank.get_account(&sysvar::rent::id()).unwrap();
+        let rent = from_account::<sysvar::rent::Rent, _>(&rent_account).unwrap();
+        assert_eq!(
+            rent.lamports_per_byte, expected_lamports_per_byte,
+            "rent sysvar should be updated after activation"
+        );
+    }
+}
+
+#[test]
+fn test_simd_0437_rent_feature_gate_activation_ordering() {
+    let (mut genesis_config, _mint_keypair) = create_genesis_config(1_000_000);
+    genesis_config.rent.lamports_per_byte = 0;
+    let (mut bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    let feature_account_balance =
+        std::cmp::max(genesis_config.rent.minimum_balance(Feature::size_of()), 1);
+
+    // Multiple activations in a single epoch boundary should settle on the lowest value.
+    let multiple_activation_features = [
+        (
+            feature_set::set_lamports_per_byte_to_6333::id(),
+            feature_set::set_lamports_per_byte_to_6333::LAMPORTS_PER_BYTE,
+        ),
+        (
+            feature_set::set_lamports_per_byte_to_2575::id(),
+            feature_set::set_lamports_per_byte_to_2575::LAMPORTS_PER_BYTE,
+        ),
+    ];
+    for (feature_id, _) in multiple_activation_features {
+        bank.store_account(
+            &feature_id,
+            &feature::create_account(&Feature { activated_at: None }, feature_account_balance),
+        );
+    }
+    goto_end_of_slot(bank.clone());
+    bank = new_from_parent_next_epoch(bank, &bank_forks, 1);
+    assert!(bank.feature_set.snapshot().set_lamports_per_byte_to_6333);
+    assert!(bank.feature_set.snapshot().set_lamports_per_byte_to_2575);
+    assert_eq!(
+        bank.rent_collector.rent.lamports_per_byte,
+        feature_set::set_lamports_per_byte_to_2575::LAMPORTS_PER_BYTE,
+        "lowest activated value should win when multiple activate in one epoch"
+    );
+
+    // Out-of-order activation across epochs should use the most recent activation.
+    bank.store_account(
+        &feature_set::set_lamports_per_byte_to_1322::id(),
+        &feature::create_account(&Feature { activated_at: None }, feature_account_balance),
+    );
+    goto_end_of_slot(bank.clone());
+    bank = new_from_parent_next_epoch(bank, &bank_forks, 1);
+    assert!(bank.feature_set.snapshot().set_lamports_per_byte_to_1322);
+    assert_eq!(
+        bank.rent_collector.rent.lamports_per_byte,
+        feature_set::set_lamports_per_byte_to_1322::LAMPORTS_PER_BYTE,
+        "first activation should be applied after its epoch boundary"
+    );
+
+    bank.store_account(
+        &feature_set::set_lamports_per_byte_to_5080::id(),
+        &feature::create_account(&Feature { activated_at: None }, feature_account_balance),
+    );
+    goto_end_of_slot(bank.clone());
+    bank = new_from_parent_next_epoch(bank, &bank_forks, 1);
+    assert!(bank.feature_set.snapshot().set_lamports_per_byte_to_5080);
+    assert_eq!(
+        bank.rent_collector.rent.lamports_per_byte,
+        feature_set::set_lamports_per_byte_to_5080::LAMPORTS_PER_BYTE,
+        "most recent activation should win even when out of order"
     );
 }
 
@@ -7160,9 +7022,10 @@ fn test_update_clock_timestamp() {
         voting_keypair,
         ..
     } = create_genesis_config_with_leader(5, &leader_pubkey, 3);
-    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     // Advance past slot 0, which has special handling.
-    bank = new_from_parent(Arc::new(bank));
+    let mut bank = new_from_parent(bank0.clone());
     bank = new_from_parent(Arc::new(bank));
     assert_eq!(
         bank.clock().unix_timestamp,
@@ -7218,20 +7081,18 @@ fn test_update_clock_timestamp() {
     );
 
     // Timestamp cannot go backward from ancestor Bank to child
+    let parent_timestamp = bank.clock().unix_timestamp;
     bank = new_from_parent(Arc::new(bank));
     update_vote_account_timestamp(
         BlockTimestamp {
             slot: bank.slot(),
-            timestamp: bank.unix_timestamp_from_genesis() - 1,
+            timestamp: parent_timestamp - 1,
         },
         &bank,
         &voting_keypair.pubkey(),
     );
     bank.update_clock(None);
-    assert_eq!(
-        bank.clock().unix_timestamp,
-        bank.unix_timestamp_from_genesis()
-    );
+    assert_eq!(bank.clock().unix_timestamp, parent_timestamp);
 }
 
 fn poh_estimate_offset(bank: &Bank) -> Duration {
@@ -7261,7 +7122,8 @@ fn test_timestamp_slow() {
     } = create_genesis_config_with_leader(5, &leader_pubkey, 3);
     let slots_in_epoch = 32;
     genesis_config.epoch_schedule = EpochSchedule::new(slots_in_epoch);
-    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (mut bank, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     let slot_duration = Duration::from_nanos(bank.ns_per_slot as u64);
 
     let recent_timestamp: UnixTimestamp = bank.unix_timestamp_from_genesis();
@@ -7279,7 +7141,7 @@ fn test_timestamp_slow() {
     // additional_secs greater than MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2 for an epoch
     // timestamp bounded to 150% deviation
     for _ in 0..31 {
-        bank = new_from_parent(Arc::new(bank));
+        bank = Arc::new(new_from_parent(bank));
         assert_eq!(
             bank.clock().unix_timestamp,
             bank.clock().epoch_start_timestamp
@@ -7305,7 +7167,8 @@ fn test_timestamp_fast() {
     } = create_genesis_config_with_leader(5, &leader_pubkey, 3);
     let slots_in_epoch = 32;
     genesis_config.epoch_schedule = EpochSchedule::new(slots_in_epoch);
-    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (mut bank, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     let recent_timestamp: UnixTimestamp = bank.unix_timestamp_from_genesis();
     let additional_secs = 5; // Greater than MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST for full epoch
@@ -7321,7 +7184,7 @@ fn test_timestamp_fast() {
     // additional_secs greater than MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST for an epoch
     // timestamp bounded to 25% deviation
     for _ in 0..31 {
-        bank = new_from_parent(Arc::new(bank));
+        bank = Arc::new(new_from_parent(bank));
         assert_eq!(
             bank.clock().unix_timestamp,
             bank.clock().epoch_start_timestamp
@@ -7424,10 +7287,7 @@ fn test_store_scan_consistency<F>(
         create_genesis_config_with_leader(10, &solana_pubkey::new_rand(), 374_999_998_287_840)
             .genesis_config;
     genesis_config.rent = Rent::free();
-    let bank0 = Arc::new(Bank::new_with_config_for_tests(
-        &genesis_config,
-        BankTestConfig::default(),
-    ));
+    let bank0 = Bank::new_with_config_for_tests(&genesis_config, BankTestConfig::default());
     bank0.set_callback(drop_callback);
 
     // Set up pubkeys to write to
@@ -7444,6 +7304,9 @@ fn test_store_scan_consistency<F>(
     for key in &all_pubkeys {
         bank0.store_account(key, &starting_account);
     }
+
+    let bank_forks = BankForks::new_rw_arc(bank0);
+    let bank0 = bank_forks.read().unwrap().root_bank();
 
     // Set aside a subset of accounts to modify
     let pubkeys_to_modify: Arc<HashSet<Pubkey>> = Arc::new(
@@ -7601,7 +7464,7 @@ fn test_store_scan_consistency_unrooted() {
                     let slot = current_minor_fork_bank.slot() + 2;
                     current_minor_fork_bank = Arc::new(Bank::new_from_parent(
                         current_minor_fork_bank,
-                        &solana_pubkey::new_rand(),
+                        SlotLeader::new_unique(),
                         slot,
                     ));
                     let account = AccountSharedData::new(lamports, 0, &program_id);
@@ -7626,7 +7489,7 @@ fn test_store_scan_consistency_unrooted() {
                 // *partial* clean of the banks < `next_major_bank`.
                 current_major_fork_bank = Arc::new(Bank::new_from_parent(
                     current_major_fork_bank,
-                    &solana_pubkey::new_rand(),
+                    SlotLeader::new_unique(),
                     current_minor_fork_bank.slot() - 1,
                 ));
                 let lamports = current_major_fork_bank.slot() + starting_lamports + 1;
@@ -7712,7 +7575,7 @@ fn test_store_scan_consistency_root() {
                 let slot = current_bank.slot() + 1;
                 current_bank = Arc::new(Bank::new_from_parent(
                     current_bank,
-                    &solana_pubkey::new_rand(),
+                    SlotLeader::new_unique(),
                     slot,
                 ));
 
@@ -7758,7 +7621,7 @@ fn setup_banks_on_fork_to_remove(
             let slot = bank_at_fork_tip.slot() + 1;
             bank_at_fork_tip = Arc::new(Bank::new_from_parent(
                 bank_at_fork_tip,
-                &solana_pubkey::new_rand(),
+                SlotLeader::new_unique(),
                 slot,
             ));
             if lamports_this_round == 0 {
@@ -7777,7 +7640,7 @@ fn setup_banks_on_fork_to_remove(
         }
     }
 
-    let ancestors: Vec<(Slot, usize)> = slots_on_fork.iter().map(|(s, _)| (*s, 0)).collect();
+    let ancestors: Vec<_> = slots_on_fork.iter().map(|(s, _)| *s).collect();
     let ancestors = Ancestors::from(ancestors);
 
     (bank_at_fork_tip, slots_on_fork, ancestors)
@@ -7968,10 +7831,11 @@ fn test_get_inflation_start_slot_devnet_testnet() {
         genesis_config.accounts.remove(&pair.enable_id).unwrap();
     }
 
-    let bank = Bank::new_for_tests(&genesis_config);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     // Advance slot
-    let mut bank = new_from_parent(Arc::new(bank));
+    let mut bank = new_from_parent(bank0.clone());
     bank = new_from_parent(Arc::new(bank));
     assert_eq!(bank.get_inflation_start_slot(), 0);
     assert_eq!(bank.slot(), 2);
@@ -8049,10 +7913,11 @@ fn test_get_inflation_start_slot_mainnet() {
         genesis_config.accounts.remove(&pair.enable_id).unwrap();
     }
 
-    let bank = Bank::new_for_tests(&genesis_config);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     // Advance slot
-    let mut bank = new_from_parent(Arc::new(bank));
+    let mut bank = new_from_parent(bank0.clone());
     bank = new_from_parent(Arc::new(bank));
     assert_eq!(bank.get_inflation_start_slot(), 0);
     assert_eq!(bank.slot(), 2);
@@ -8136,9 +8001,11 @@ fn test_get_inflation_num_slots_with_activations() {
         genesis_config.accounts.remove(&pair.enable_id).unwrap();
     }
 
-    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+    let mut bank = new_from_parent(bank0);
     assert_eq!(bank.get_inflation_num_slots(), 0);
-    for _ in 0..2 * slots_per_epoch {
+    for _ in 0..2 * slots_per_epoch - 1 {
         bank = new_from_parent(Arc::new(bank));
     }
     assert_eq!(bank.get_inflation_num_slots(), 2 * slots_per_epoch);
@@ -8187,9 +8054,11 @@ fn test_get_inflation_num_slots_already_activated() {
     } = create_genesis_config_with_leader(42, &solana_pubkey::new_rand(), 42);
     let slots_per_epoch = 32;
     genesis_config.epoch_schedule = EpochSchedule::new(slots_per_epoch);
-    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+    let mut bank = new_from_parent(bank0);
     assert_eq!(bank.get_inflation_num_slots(), 0);
-    for _ in 0..slots_per_epoch {
+    for _ in 0..slots_per_epoch - 1 {
         bank = new_from_parent(Arc::new(bank));
     }
     assert_eq!(bank.get_inflation_num_slots(), slots_per_epoch);
@@ -8365,7 +8234,7 @@ fn test_vote_epoch_panic() {
     let _bank = Bank::new_from_parent_with_bank_forks(
         bank_forks.as_ref(),
         bank,
-        &mint_keypair.pubkey(),
+        SlotLeader::new_unique(),
         genesis_config.epoch_schedule.get_first_slot_in_epoch(1),
     );
 }
@@ -8413,7 +8282,6 @@ fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
     let commit_results = bank
         .load_execute_and_commit_transactions(
             &batch,
-            MAX_PROCESSING_AGE,
             ExecutionRecordingConfig {
                 enable_cpi_recording: false,
                 enable_log_recording: true,
@@ -8428,21 +8296,25 @@ fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
     assert_eq!(commit_results.len(), 3);
 
     assert!(commit_results[0].is_ok());
-    assert!(commit_results[0]
-        .as_ref()
-        .unwrap()
-        .log_messages
-        .as_ref()
-        .unwrap()[1]
-        .contains(&"success".to_string()));
+    assert!(
+        commit_results[0]
+            .as_ref()
+            .unwrap()
+            .log_messages
+            .as_ref()
+            .unwrap()[1]
+            .contains(&"success".to_string())
+    );
     assert!(commit_results[1].is_ok());
-    assert!(commit_results[1]
-        .as_ref()
-        .unwrap()
-        .log_messages
-        .as_ref()
-        .unwrap()[2]
-        .contains(&"failed".to_string()));
+    assert!(
+        commit_results[1]
+            .as_ref()
+            .unwrap()
+            .log_messages
+            .as_ref()
+            .unwrap()[2]
+            .contains(&"failed".to_string())
+    );
     if relax_intrabatch_account_locks {
         assert!(commit_results[2].is_ok());
     } else {
@@ -8479,8 +8351,11 @@ fn test_tx_return_data() {
         bootstrap_validator_stake_lamports(),
     );
     let mock_program_id = Pubkey::from([2u8; 32]);
-    let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, mock_program_id, MockBuiltin::vm);
+    let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
+        &genesis_config,
+        mock_program_id,
+        MockBuiltin::register,
+    );
 
     declare_process_instruction!(MockBuiltin, 1, |invoke_context| {
         let mock_program_id = Pubkey::from([2u8; 32]);
@@ -8525,7 +8400,6 @@ fn test_tx_return_data() {
         let commit_results = bank
             .load_execute_and_commit_transactions(
                 &batch,
-                MAX_PROCESSING_AGE,
                 ExecutionRecordingConfig {
                     enable_cpi_recording: false,
                     enable_log_recording: false,
@@ -8564,11 +8438,11 @@ fn test_get_largest_accounts() {
         .iter()
         .cloned()
         .zip(vec![
-            2 * LAMPORTS_PER_SOL,
-            3 * LAMPORTS_PER_SOL,
-            3 * LAMPORTS_PER_SOL,
-            4 * LAMPORTS_PER_SOL,
-            5 * LAMPORTS_PER_SOL,
+            200 * LAMPORTS_PER_SOL,
+            300 * LAMPORTS_PER_SOL,
+            300 * LAMPORTS_PER_SOL,
+            400 * LAMPORTS_PER_SOL,
+            500 * LAMPORTS_PER_SOL,
         ])
         .collect();
 
@@ -8598,17 +8472,17 @@ fn test_get_largest_accounts() {
     assert_eq!(
         bank.get_largest_accounts(1, &pubkeys_hashset, AccountAddressFilter::Include, false)
             .unwrap(),
-        vec![(pubkeys[4], 5 * LAMPORTS_PER_SOL)]
+        vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
     );
     assert_eq!(
         bank.get_largest_accounts(1, &exclude_hashset, AccountAddressFilter::Exclude, false)
             .unwrap(),
-        vec![(pubkeys[4], 5 * LAMPORTS_PER_SOL)]
+        vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
     );
     assert_eq!(
         bank.get_largest_accounts(1, &exclude4, AccountAddressFilter::Exclude, false)
             .unwrap(),
-        vec![(pubkeys[3], 4 * LAMPORTS_PER_SOL)]
+        vec![(pubkeys[3], 400 * LAMPORTS_PER_SOL)]
     );
 
     // Return all added accounts
@@ -8683,7 +8557,7 @@ fn test_transfer_sysvar() {
     let program_id = solana_pubkey::new_rand();
 
     let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::vm);
+        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::register);
 
     declare_process_instruction!(MockBuiltin, 1, |invoke_context| {
         let transaction_context = &invoke_context.transaction_context;
@@ -8773,7 +8647,7 @@ fn do_test_clean_dropped_unrooted_banks(freeze_bank1: FreezeBank1) {
     let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let amount = genesis_config.rent.minimum_balance(0);
 
-    let collector = Pubkey::new_unique();
+    let leader = SlotLeader::new_unique();
     let owner = Pubkey::new_unique();
 
     let key1 = Keypair::new(); // only touched in bank1
@@ -8788,7 +8662,7 @@ fn do_test_clean_dropped_unrooted_banks(freeze_bank1: FreezeBank1) {
 
     let slot = 1;
     let bank1 =
-        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0.clone(), &collector, slot);
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0.clone(), leader, slot);
     add_root_and_flush_write_cache(&bank0);
     bank1
         .transfer(amount, &mint_keypair, &key1.pubkey())
@@ -8806,13 +8680,17 @@ fn do_test_clean_dropped_unrooted_banks(freeze_bank1: FreezeBank1) {
     }
 
     let slot = slot + 1;
-    let bank2 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot);
+    let bank2 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, leader, slot);
     bank2
         .transfer(amount * 2, &mint_keypair, &key2.pubkey())
         .unwrap();
     bank2
         .transfer(amount, &mint_keypair, &key3.pubkey())
         .unwrap();
+    // Store accounts with lamports to populate the index
+    bank2.store_account(&key5.pubkey(), &AccountSharedData::new(1, 0, &owner));
+
+    // Then set the accounts to zero lamports
     bank2.store_account(&key5.pubkey(), &AccountSharedData::new(0, 0, &owner));
 
     bank2.freeze(); // the freeze here is not strictly necessary, but more for illustration
@@ -8826,22 +8704,40 @@ fn do_test_clean_dropped_unrooted_banks(freeze_bank1: FreezeBank1) {
     let expected_ref_count_for_cleaned_up_keys = 0;
     let expected_ref_count_for_keys_in_both_slot1_and_slot2 = 1;
 
-    bank2
-        .rc
-        .accounts
-        .accounts_db
-        .assert_ref_count(&key1.pubkey(), expected_ref_count_for_cleaned_up_keys);
-    bank2.rc.accounts.accounts_db.assert_ref_count(
-        &key3.pubkey(),
+    assert_eq!(
+        bank2
+            .rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .ref_count_from_storage(&key1.pubkey()),
+        expected_ref_count_for_cleaned_up_keys,
+    );
+    assert_eq!(
+        bank2
+            .rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .ref_count_from_storage(&key3.pubkey()),
         expected_ref_count_for_keys_in_both_slot1_and_slot2,
     );
-    bank2
-        .rc
-        .accounts
-        .accounts_db
-        .assert_ref_count(&key4.pubkey(), expected_ref_count_for_cleaned_up_keys);
-    bank2.rc.accounts.accounts_db.assert_ref_count(
-        &key5.pubkey(),
+    assert_eq!(
+        bank2
+            .rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .ref_count_from_storage(&key4.pubkey()),
+        expected_ref_count_for_cleaned_up_keys,
+    );
+    assert_eq!(
+        bank2
+            .rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .ref_count_from_storage(&key5.pubkey()),
         expected_ref_count_for_keys_in_both_slot1_and_slot2,
     );
     assert_eq!(
@@ -8864,7 +8760,7 @@ fn test_compute_budget_program_noop() {
     );
     let program_id = solana_pubkey::new_rand();
     let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::vm);
+        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::register);
 
     declare_process_instruction!(MockBuiltin, 1, |invoke_context| {
         let compute_budget = ComputeBudget::from_budget_and_cost(
@@ -8882,9 +8778,6 @@ fn test_compute_budget_program_noop() {
                     invoke_context
                         .get_feature_set()
                         .raise_cpi_nesting_limit_to_8,
-                    invoke_context
-                        .get_feature_set()
-                        .increase_cpi_account_info_limit
                 )
             }
         );
@@ -8919,7 +8812,7 @@ fn test_compute_request_instruction() {
     );
     let program_id = solana_pubkey::new_rand();
     let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::vm);
+        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::register);
 
     declare_process_instruction!(MockBuiltin, 1, |invoke_context| {
         let compute_budget = ComputeBudget::from_budget_and_cost(
@@ -8937,9 +8830,6 @@ fn test_compute_request_instruction() {
                     invoke_context
                         .get_feature_set()
                         .raise_cpi_nesting_limit_to_8,
-                    invoke_context
-                        .get_feature_set()
-                        .increase_cpi_account_info_limit
                 )
             }
         );
@@ -8975,7 +8865,7 @@ fn test_failed_compute_request_instruction() {
 
     let program_id = solana_pubkey::new_rand();
     let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::vm);
+        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::register);
 
     let payer0_keypair = Keypair::new();
     let payer1_keypair = Keypair::new();
@@ -8999,9 +8889,6 @@ fn test_failed_compute_request_instruction() {
                     invoke_context
                         .get_feature_set()
                         .raise_cpi_nesting_limit_to_8,
-                    invoke_context
-                        .get_feature_set()
-                        .increase_cpi_account_info_limit
                 )
             }
         );
@@ -9123,9 +9010,10 @@ fn test_verify_transactions_packet_data_size() {
     {
         let tx = make_transaction(5);
         assert!(bincode::serialized_size(&tx).unwrap() <= PACKET_DATA_SIZE as u64);
-        assert!(bank
-            .verify_transaction(tx.into(), TransactionVerificationMode::FullVerification)
-            .is_ok(),);
+        assert!(
+            bank.verify_transaction(tx.into(), TransactionVerificationMode::FullVerification)
+                .is_ok(),
+        );
     }
     // Big transaction.
     {
@@ -9148,15 +9036,11 @@ fn test_verify_transactions_packet_data_size() {
     }
 }
 
-#[test_case(false; "pre_simd160_static_instruction_limit")]
-#[test_case(true; "simd160_static_instruction_limit")]
-fn test_verify_transactions_instruction_limit(simd_0160_enabled: bool) {
+#[test]
+fn test_verify_transactions_instruction_limit() {
     let GenesisConfigInfo { genesis_config, .. } =
         create_genesis_config_with_leader(42, &solana_pubkey::new_rand(), 42);
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    if !simd_0160_enabled {
-        bank.deactivate_feature(&feature_set::static_instruction_limit::id());
-    }
+    let bank = Bank::new_for_tests(&genesis_config);
 
     let recent_blockhash = Hash::new_unique();
     let keypair = Keypair::new();
@@ -9181,23 +9065,63 @@ fn test_verify_transactions_instruction_limit(simd_0160_enabled: bool) {
 
     assert!(bincode::serialized_size(&tx).unwrap() <= PACKET_DATA_SIZE as u64);
 
-    if simd_0160_enabled {
+    assert_matches!(
+        bank.verify_transaction(tx.into(), TransactionVerificationMode::FullVerification),
+        Err(TransactionError::SanitizeFailure)
+    );
+}
+
+#[test_case(false; "pre_simd406_limit_instruction_accounts")]
+#[test_case(true; "simd406_limit_instruction_accounts")]
+fn test_verify_transactions_accounts_limit(simd_406_enabled: bool) {
+    let GenesisConfigInfo { genesis_config, .. } =
+        create_genesis_config_with_leader(42, &solana_pubkey::new_rand(), 42);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    if !simd_406_enabled {
+        bank.deactivate_feature(&feature_set::limit_instruction_accounts::id());
+    }
+
+    let recent_blockhash = Hash::new_unique();
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
+    let mut accounts_keys = vec![Pubkey::new_unique(); 10];
+    accounts_keys.insert(0, pubkey);
+    let accounts: Vec<u8> = (0..10).cycle().take(256).collect();
+    let instruction = CompiledInstruction {
+        program_id_index: 1,
+        data: vec![],
+        accounts,
+    };
+
+    let message = Message::new_with_compiled_instructions(
+        1,
+        0,
+        1,
+        accounts_keys,
+        recent_blockhash,
+        vec![instruction],
+    );
+    let tx = Transaction::new(&[&keypair], message, recent_blockhash);
+
+    if simd_406_enabled {
         assert_matches!(
             bank.verify_transaction(tx.into(), TransactionVerificationMode::FullVerification),
             Err(TransactionError::SanitizeFailure)
         );
     } else {
-        assert!(bank
-            .verify_transaction(tx.into(), TransactionVerificationMode::FullVerification)
-            .is_ok());
+        assert!(
+            bank.verify_transaction(tx.into(), TransactionVerificationMode::FullVerification)
+                .is_ok()
+        );
     }
 }
 
 #[test]
 fn test_check_reserved_keys() {
     let (genesis_config, _mint_keypair) = create_genesis_config(1);
-    let bank = Bank::new_for_tests(&genesis_config);
-    let mut bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::new_unique(), 1);
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+    let mut bank = Bank::new_from_parent(bank0, SlotLeader::new_unique(), 1);
 
     let transaction =
         SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
@@ -9269,26 +9193,13 @@ fn test_call_precomiled_program() {
     bank.process_transaction(&tx).unwrap();
 
     // ed25519
-    // Since ed25519_dalek is still using the old version of rand, this test
-    // copies the `generate` implementation at:
-    // https://docs.rs/ed25519-dalek/1.0.1/src/ed25519_dalek/secret.rs.html#167
-    let privkey = {
-        use rand::RngCore;
-        let mut rng = rand::rng();
-        let mut seed = [0u8; ed25519_dalek::SECRET_KEY_LENGTH];
-        rng.fill_bytes(&mut seed);
-        let secret =
-            ed25519_dalek::SecretKey::from_bytes(&seed[..ed25519_dalek::SECRET_KEY_LENGTH])
-                .unwrap();
-        let public = ed25519_dalek::PublicKey::from(&secret);
-        ed25519_dalek::Keypair { secret, public }
-    };
     let message_arr = b"hello";
-    let signature = privkey.sign(message_arr).to_bytes();
-    let pubkey = privkey.public.to_bytes();
+    let keypair = Keypair::new();
+    let signature = keypair.sign_message(message_arr);
+    let pubkey = keypair.pubkey().to_bytes();
     let instruction = solana_ed25519_program::new_ed25519_instruction_with_signature(
         message_arr,
-        &signature,
+        signature.as_array(),
         &pubkey,
     );
     let tx = Transaction::new_signed_with_payer(
@@ -9319,9 +9230,7 @@ fn calculate_test_fee(
         lamports_per_signature == 0,
         fee_structure.lamports_per_signature,
         fee_budget_limits.prioritization_fee,
-        FeeFeatures {
-            enable_secp256r1_precompile: true,
-        },
+        FeeFeatures {},
     )
 }
 
@@ -9698,7 +9607,7 @@ fn test_invalid_rent_state_changes_existing_accounts() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         mock_program_id,
-        MockTransferBuiltin::vm,
+        MockTransferBuiltin::register,
     );
     let recent_blockhash = bank.last_blockhash();
 
@@ -9751,7 +9660,7 @@ fn test_invalid_rent_state_changes_new_accounts() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         mock_program_id,
-        MockTransferBuiltin::vm,
+        MockTransferBuiltin::register,
     );
     let recent_blockhash = bank.last_blockhash();
 
@@ -9813,7 +9722,7 @@ fn test_drained_created_account() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         mock_program_id,
-        MockTransferBuiltin::vm,
+        MockTransferBuiltin::register,
     );
     let recent_blockhash = bank.last_blockhash();
 
@@ -9921,12 +9830,17 @@ fn test_rent_state_changes_sysvars() {
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
     // Ensure transactions with sysvars succeed, even though sysvars appear RentPaying by balance
+    let (bls_pubkey, bls_proof_of_possession) =
+        create_bls_pubkey_and_proof_of_possession(&validator_vote_account_pubkey);
     let tx = Transaction::new_signed_with_payer(
         &[vote_instruction::authorize(
             &validator_vote_account_pubkey,
             &validator_voting_keypair.pubkey(),
             &Pubkey::new_unique(),
-            VoteAuthorize::Voter,
+            VoteAuthorize::VoterWithBLS(VoterWithBLSArgs {
+                bls_pubkey,
+                bls_proof_of_possession,
+            }),
         )],
         Some(&mint_keypair.pubkey()),
         &[&mint_keypair, &validator_voting_keypair],
@@ -10263,7 +10177,7 @@ fn test_resize_and_rent() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         mock_program_id,
-        MockReallocBuiltin::vm,
+        MockReallocBuiltin::register,
     );
 
     let recent_blockhash = bank.last_blockhash();
@@ -10476,7 +10390,7 @@ fn test_accounts_data_size_and_resize_transactions() {
     let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
         &genesis_config,
         mock_program_id,
-        MockReallocBuiltin::vm,
+        MockReallocBuiltin::register,
     );
 
     let recent_blockhash = bank.last_blockhash();
@@ -10583,7 +10497,7 @@ fn test_accounts_data_size_from_genesis() {
         bank = Bank::new_from_parent_with_bank_forks(
             bank_forks.as_ref(),
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             slot,
         );
 
@@ -10785,15 +10699,13 @@ fn test_feature_activation_loaded_programs_cache_preparation_phase() {
 
     // Advance the bank to middle of epoch to start the recompilation phase.
     goto_end_of_slot(bank.clone());
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 16);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 16);
     let current_env = bank
         .transaction_processor
-        .get_environments_for_epoch(0)
-        .program_runtime_v1;
+        .program_runtime_environment_for_epoch(0);
     let upcoming_env = bank
         .transaction_processor
-        .get_environments_for_epoch(1)
-        .program_runtime_v1;
+        .program_runtime_environment_for_epoch(1);
 
     // Advance the bank to recompile the program.
     {
@@ -10804,10 +10716,10 @@ fn test_feature_activation_loaded_programs_cache_preparation_phase() {
             .unwrap();
         let slot_versions = program_cache.get_slot_versions_for_tests(&program_keypair.pubkey());
         assert_eq!(slot_versions.len(), 1);
-        assert!(Arc::ptr_eq(
+        assert_eq!(
             slot_versions[0].program.get_environment().unwrap(),
-            &current_env
-        ));
+            &current_env,
+        );
     }
     goto_end_of_slot(bank.clone());
     let bank = new_from_parent_with_fork_next_slot(bank, bank_forks.as_ref());
@@ -10819,19 +10731,19 @@ fn test_feature_activation_loaded_programs_cache_preparation_phase() {
             .unwrap();
         let slot_versions = program_cache.get_slot_versions_for_tests(&program_keypair.pubkey());
         assert_eq!(slot_versions.len(), 2);
-        assert!(Arc::ptr_eq(
+        assert_eq!(
             slot_versions[0].program.get_environment().unwrap(),
-            &upcoming_env
-        ));
-        assert!(Arc::ptr_eq(
+            &upcoming_env,
+        );
+        assert_eq!(
             slot_versions[1].program.get_environment().unwrap(),
-            &current_env
-        ));
+            &current_env,
+        );
     }
 
     // Advance the bank to cross the epoch boundary and activate the feature.
     goto_end_of_slot(bank.clone());
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 33);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 33);
 
     // Load the program with the new environment.
     let transaction = Transaction::new(&signers, message, bank.last_blockhash());
@@ -10895,11 +10807,11 @@ fn test_feature_activation_loaded_programs_epoch_transition() {
 
     // Advance the bank to the end of the epoch to update the epoch_boundary_preparation.
     goto_end_of_slot(bank.clone());
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 31);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 31);
 
     // Advance the bank to cross the epoch boundary and activate the feature.
     goto_end_of_slot(bank.clone());
-    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 32);
+    let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 32);
 
     // Load the program with the new environment.
     let transaction = Transaction::new(&signers, message.clone(), bank.last_blockhash());
@@ -10907,19 +10819,19 @@ fn test_feature_activation_loaded_programs_epoch_transition() {
 
     {
         // Prune for rerooting and thus finishing the recompilation phase.
-        let upcoming_environments = bank
+        let upcoming_environment = bank
             .transaction_processor
             .epoch_boundary_preparation
             .write()
             .unwrap()
             .reroot(bank.epoch());
-        assert!(upcoming_environments.is_some());
+        assert!(upcoming_environment.is_some());
         let mut program_cache = bank
             .transaction_processor
             .global_program_cache
             .write()
             .unwrap();
-        program_cache.prune(bank.slot(), upcoming_environments);
+        program_cache.prune(bank.slot(), upcoming_environment);
 
         // Unload all (which is only the entry with the new environment)
         program_cache.sort_and_unload(percentage::Percentage::from(0));
@@ -10975,7 +10887,7 @@ fn test_verify_accounts() {
         bank = Bank::new_from_parent_with_bank_forks(
             bank_forks.as_ref(),
             bank,
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             slot,
         );
         do_transfers(&bank);
@@ -11041,15 +10953,19 @@ fn test_system_instruction_allocate() {
         Some(&alice_pubkey),
     );
 
-    assert!(bank_client
-        .send_and_confirm_message(&[&alice_keypair], allocate_with_seed)
-        .is_ok());
+    assert!(
+        bank_client
+            .send_and_confirm_message(&[&alice_keypair], allocate_with_seed)
+            .is_ok()
+    );
 
     let allocate = system_instruction::allocate(&alice_pubkey, data_len as u64);
 
-    assert!(bank_client
-        .send_and_confirm_instruction(&alice_keypair, allocate)
-        .is_ok());
+    assert!(
+        bank_client
+            .send_and_confirm_instruction(&alice_keypair, allocate)
+            .is_ok()
+    );
 }
 
 fn with_create_zero_lamport<F>(callback: F)
@@ -11065,7 +10981,7 @@ where
     let bob_pubkey = bob_keypair.pubkey();
 
     let program = Pubkey::new_unique();
-    let collector = Pubkey::new_unique();
+    let leader = SlotLeader::new_unique();
 
     let mint_lamports = LAMPORTS_PER_SOL;
     let len1 = 123;
@@ -11084,19 +11000,19 @@ where
 
     // create the next bank in the current epoch and populate bob's account with some lamports and data
     let slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, slot);
     let account = AccountSharedData::new(1, len1, &program);
     bank.store_account(&bob_pubkey, &account);
 
     // create the next bank where we will store a zero-lamport account to be cleaned
     let slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, slot);
     let account = AccountSharedData::new(0, len1, &program);
     bank.store_account(&bob_pubkey, &account);
 
     // transfer some to bogus pubkey just to make previous bank (=slot) really cleanable
     let slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, slot);
     let bank_client = BankClient::new_shared(bank.clone());
     bank_client
         .transfer_and_confirm(
@@ -11108,13 +11024,13 @@ where
 
     // super fun time; callback chooses to .clean_accounts() or not
     let slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, slot);
     callback(&bank);
 
     // create a normal account at the same pubkey as the zero-lamports account
     let lamports = genesis_config.rent.minimum_balance(len2);
     let slot = bank.slot() + 1;
-    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+    let bank = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, leader, slot);
     let bank_client = BankClient::new_shared(bank);
     let ix = system_instruction::create_account(
         &alice_pubkey,
@@ -11190,9 +11106,11 @@ fn test_system_instruction_assign_with_seed() {
         Some(&alice_pubkey),
     );
 
-    assert!(bank_client
-        .send_and_confirm_message(&[&alice_keypair], assign_with_seed)
-        .is_ok());
+    assert!(
+        bank_client
+            .send_and_confirm_message(&[&alice_keypair], assign_with_seed)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -11236,56 +11154,56 @@ fn test_system_instruction_unsigned_transaction() {
 }
 
 #[test]
-fn test_calc_vote_accounts_to_store_empty() {
-    let vote_account_rewards = HashMap::default();
-    let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
+fn test_calculate_commission_accounts_empty() {
+    let reward_commissions = HashMap::default();
+    let result = Bank::calculate_commission_accounts(reward_commissions);
     assert!(result.accounts_with_rewards.is_empty());
 }
 
 #[test]
-fn test_calc_vote_accounts_to_store_overflow() {
-    let mut vote_account_rewards = HashMap::default();
+fn test_calculate_commission_accounts_overflow() {
+    let mut reward_commissions = HashMap::default();
     let pubkey = solana_pubkey::new_rand();
-    let mut vote_account = AccountSharedData::default();
-    vote_account.set_lamports(u64::MAX);
-    vote_account_rewards.insert(
+    let mut commission_account = AccountSharedData::default();
+    commission_account.set_lamports(u64::MAX);
+    reward_commissions.insert(
         pubkey,
-        VoteReward {
-            vote_account,
+        RewardCommission {
+            commission_account,
             commission_bps: 0,
-            vote_rewards: 1, // enough to overflow
+            commission_lamports: 1, // enough to overflow
         },
     );
-    let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
+    let result = Bank::calculate_commission_accounts(reward_commissions);
     assert!(result.accounts_with_rewards.is_empty());
 }
 
 #[test]
-fn test_calc_vote_accounts_to_store_normal() {
+fn test_calculate_commission_accounts_normal() {
     let pubkey = solana_pubkey::new_rand();
     for commission_bps in [0, 100] {
-        for vote_rewards in 0..2 {
-            let mut vote_account_rewards = HashMap::default();
-            let mut vote_account = AccountSharedData::default();
-            vote_account.set_lamports(1);
-            vote_account_rewards.insert(
+        for commission_lamports in 0..2 {
+            let mut reward_commissions = HashMap::default();
+            let mut commission_account = AccountSharedData::default();
+            commission_account.set_lamports(1);
+            reward_commissions.insert(
                 pubkey,
-                VoteReward {
-                    vote_account: vote_account.clone(),
+                RewardCommission {
+                    commission_account: commission_account.clone(),
                     commission_bps,
-                    vote_rewards,
+                    commission_lamports,
                 },
             );
-            let result = Bank::calc_vote_accounts_to_store(vote_account_rewards);
+            let result = Bank::calculate_commission_accounts(reward_commissions);
             assert_eq!(result.accounts_with_rewards.len(), 1);
             let (pubkey_result, rewards, account) = &result.accounts_with_rewards[0];
-            _ = vote_account.checked_add_lamports(vote_rewards);
-            assert!(accounts_equal(account, &vote_account));
+            _ = commission_account.checked_add_lamports(commission_lamports);
+            assert!(accounts_equal(account, &commission_account));
 
             let expected_reward_info = RewardInfo {
                 reward_type: RewardType::Voting,
-                lamports: vote_rewards as i64,
-                post_balance: vote_account.lamports(),
+                lamports: commission_lamports as i64,
+                post_balance: commission_account.lamports(),
                 commission_bps: Some(commission_bps),
             };
             assert_eq!(*rewards, expected_reward_info);
@@ -11301,16 +11219,17 @@ fn test_register_hard_fork() {
     }
 
     let (genesis_config, _mint_keypair) = create_genesis_config(10);
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
-    let bank7 = Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 7);
+    let bank7 = Bank::new_from_parent(bank0.clone(), SlotLeader::default(), 7);
     bank7.register_hard_fork(6);
     bank7.register_hard_fork(7);
     bank7.register_hard_fork(8);
     // Bank7 will reject slot 6 since it is older, but allow the other two hard forks
     assert_eq!(get_hard_forks(&bank7), vec![7, 8]);
 
-    let bank9 = Bank::new_from_parent(bank0, &Pubkey::default(), 9);
+    let bank9 = Bank::new_from_parent(bank0, SlotLeader::default(), 9);
     bank9.freeze();
     bank9.register_hard_fork(9);
     bank9.register_hard_fork(10);
@@ -11342,54 +11261,38 @@ fn test_last_restart_slot() {
     let mint_lamports = 100;
     let validator_stake_lamports = 10;
     let leader_pubkey = Pubkey::default();
-    let GenesisConfigInfo {
-        mut genesis_config, ..
-    } = create_genesis_config_with_leader(mint_lamports, &leader_pubkey, validator_stake_lamports);
-    // Remove last restart slot account so we can simluate its' activation
-    genesis_config
-        .accounts
-        .remove(&feature_set::last_restart_slot_sysvar::id())
-        .unwrap();
+    let GenesisConfigInfo { genesis_config, .. } =
+        create_genesis_config_with_leader(mint_lamports, &leader_pubkey, validator_stake_lamports);
 
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     // Register a hard fork in the future so last restart slot will update
-    bank0.register_hard_fork(6);
-    assert!(!last_restart_slot_dirty(&bank0));
-    assert_eq!(get_last_restart_slot(&bank0), None);
-
-    let mut bank1 = Arc::new(Bank::new_from_parent(bank0, &Pubkey::default(), 1));
-    assert!(!last_restart_slot_dirty(&bank1));
-    assert_eq!(get_last_restart_slot(&bank1), None);
-
-    // Activate the feature in slot 1, it will get initialized in slot 1's children
-    Arc::get_mut(&mut bank1)
-        .unwrap()
-        .activate_feature(&feature_set::last_restart_slot_sysvar::id());
-    let bank2 = Arc::new(Bank::new_from_parent(bank1.clone(), &Pubkey::default(), 2));
-    assert!(last_restart_slot_dirty(&bank2));
-    assert_eq!(get_last_restart_slot(&bank2), Some(0));
-    let bank3 = Arc::new(Bank::new_from_parent(bank1, &Pubkey::default(), 3));
-    assert!(last_restart_slot_dirty(&bank3));
-    assert_eq!(get_last_restart_slot(&bank3), Some(0));
+    bank0.register_hard_fork(3);
+    assert!(last_restart_slot_dirty(&bank0));
+    assert_eq!(get_last_restart_slot(&bank0), Some(0));
 
     // Not dirty in children where the last restart slot has not changed
-    let bank4 = Arc::new(Bank::new_from_parent(bank2, &Pubkey::default(), 4));
-    assert!(!last_restart_slot_dirty(&bank4));
-    assert_eq!(get_last_restart_slot(&bank4), Some(0));
-    let bank5 = Arc::new(Bank::new_from_parent(bank3, &Pubkey::default(), 5));
-    assert!(!last_restart_slot_dirty(&bank5));
-    assert_eq!(get_last_restart_slot(&bank5), Some(0));
+    let bank1 = Arc::new(Bank::new_from_parent(
+        bank0.clone(),
+        SlotLeader::default(),
+        1,
+    ));
+    assert!(!last_restart_slot_dirty(&bank1));
+    assert_eq!(get_last_restart_slot(&bank1), Some(0));
+    let bank2 = Arc::new(Bank::new_from_parent(bank0, SlotLeader::default(), 2));
+    assert!(!last_restart_slot_dirty(&bank2));
+    assert_eq!(get_last_restart_slot(&bank2), Some(0));
 
     // Last restart slot has now changed so it will be dirty again
-    let bank6 = Arc::new(Bank::new_from_parent(bank4, &Pubkey::default(), 6));
-    assert!(last_restart_slot_dirty(&bank6));
-    assert_eq!(get_last_restart_slot(&bank6), Some(6));
+    let bank3 = Arc::new(Bank::new_from_parent(bank2, SlotLeader::default(), 3));
+    assert!(last_restart_slot_dirty(&bank3));
+    assert_eq!(get_last_restart_slot(&bank3), Some(3));
 
     // Last restart will not change for a hard fork that has not occurred yet
-    bank6.register_hard_fork(10);
-    let bank7 = Arc::new(Bank::new_from_parent(bank6, &Pubkey::default(), 7));
-    assert!(!last_restart_slot_dirty(&bank7));
-    assert_eq!(get_last_restart_slot(&bank7), Some(6));
+    bank3.register_hard_fork(6);
+    let bank4 = Arc::new(Bank::new_from_parent(bank3, SlotLeader::default(), 4));
+    assert!(!last_restart_slot_dirty(&bank4));
+    assert_eq!(get_last_restart_slot(&bank4), Some(3));
 }
 
 /// Test that simulations report the compute units of failed transactions
@@ -11398,7 +11301,7 @@ fn test_failed_simulation_compute_units() {
     let (genesis_config, mint_keypair) = create_genesis_config(LAMPORTS_PER_SOL);
     let program_id = Pubkey::new_unique();
     let (bank, _bank_forks) =
-        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::vm);
+        Bank::new_with_mockup_builtin_for_tests(&genesis_config, program_id, MockBuiltin::register);
 
     const TEST_UNITS: u64 = 10_000;
     const MOCK_BUILTIN_UNITS: u64 = 1;
@@ -11543,7 +11446,7 @@ fn test_deploy_last_epoch_slot() {
     let bank = Bank::new_from_parent_with_bank_forks(
         &bank_forks,
         bank,
-        &Pubkey::default(),
+        SlotLeader::default(),
         slots_in_epoch - 1,
     );
     eprintln!("now at slot {} epoch {}", bank.slot(), bank.epoch());
@@ -11606,7 +11509,7 @@ fn test_deploy_last_epoch_slot() {
         Some(&payer_keypair.pubkey()),
     );
     let signers = &[&payer_keypair, &upgrade_authority_keypair];
-    let transaction = Transaction::new(signers, message.clone(), bank.last_blockhash());
+    let transaction = Transaction::new(signers, message, bank.last_blockhash());
     let ret = bank.process_transaction(&transaction);
     assert!(ret.is_ok(), "ret: {ret:?}");
     goto_end_of_slot(bank.clone());
@@ -11615,7 +11518,7 @@ fn test_deploy_last_epoch_slot() {
     let bank = Bank::new_from_parent_with_bank_forks(
         &bank_forks,
         bank,
-        &Pubkey::default(),
+        SlotLeader::default(),
         slots_in_epoch,
     );
     eprintln!("now at slot {} epoch {}", bank.slot(), bank.epoch());
@@ -11710,8 +11613,7 @@ fn test_loader_v3_to_v4_migration() {
         Some(&payer_keypair.pubkey()),
     );
     let signers = &[&payer_keypair, &program_keypair];
-    let finalized_migration_transaction =
-        Transaction::new(signers, message.clone(), bank.last_blockhash());
+    let finalized_migration_transaction = Transaction::new(signers, message, bank.last_blockhash());
 
     let mut upgradeable_programdata_account = AccountSharedData::new(
         0,
@@ -11745,7 +11647,7 @@ fn test_loader_v3_to_v4_migration() {
     );
     let signers = &[&payer_keypair, &upgrade_authority_keypair];
     let upgradeable_migration_transaction =
-        Transaction::new(signers, message.clone(), bank.last_blockhash());
+        Transaction::new(signers, message, bank.last_blockhash());
 
     let payer_account = AccountSharedData::new(LAMPORTS_PER_SOL, 0, &system_program::id());
     bank.store_account(
@@ -11769,19 +11671,15 @@ fn test_loader_v3_to_v4_migration() {
         Some(&payer_keypair.pubkey()),
     );
     let signers = &[&payer_keypair];
-    let transaction = Transaction::new(signers, message.clone(), bank.last_blockhash());
+    let transaction = Transaction::new(signers, message, bank.last_blockhash());
     let error = bank.process_transaction(&transaction).unwrap_err();
     assert_eq!(
         error,
         TransactionError::InstructionError(0, InstructionError::InvalidArgument)
     );
 
-    let bank = Bank::new_from_parent_with_bank_forks(
-        &bank_forks,
-        bank.clone(),
-        &Pubkey::default(),
-        next_slot,
-    );
+    let bank =
+        Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), next_slot);
     next_slot += 1;
 
     // All other error cases
@@ -11905,7 +11803,7 @@ fn test_loader_v3_to_v4_migration() {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank.clone(),
-            &Pubkey::default(),
+            SlotLeader::default(),
             next_slot,
         );
         next_slot += 1;
@@ -11924,8 +11822,12 @@ fn test_loader_v3_to_v4_migration() {
         assert!(result.is_ok(), "result: {result:?}");
 
         goto_end_of_slot(bank.clone());
-        let bank =
-            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), next_slot);
+        let bank = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            bank,
+            SlotLeader::default(),
+            next_slot,
+        );
         next_slot += 1;
 
         let instruction = Instruction::new_with_bytes(program_keypair.pubkey(), &[], Vec::new());
@@ -11940,7 +11842,8 @@ fn test_loader_v3_to_v4_migration() {
 #[test]
 fn test_blockhash_last_valid_block_height() {
     let genesis_config = GenesisConfig::default();
-    let mut bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (mut bank, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     // valid until MAX_PROCESSING_AGE
     let last_blockhash = bank.last_blockhash();
@@ -11999,10 +11902,11 @@ fn test_bank_epoch_stakes() {
     let GenesisConfigInfo { genesis_config, .. } =
         create_genesis_config_with_vote_accounts(1_000_000_000, &voting_keypairs, stakes.clone());
 
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (bank0, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
     let mut bank1 = Bank::new_from_parent(
         bank0.clone(),
-        &Pubkey::default(),
+        SlotLeader::default(),
         bank0.get_slots_in_epoch(0) + 1,
     );
 
@@ -12242,7 +12146,6 @@ fn test_genesis_deprecate_rent_exemption_enabled() {
 
     assert_eq!(accounts_db_rent, tx_processor_rent);
     assert_eq!(accounts_db_rent, rent_collector_rent);
-    assert!(accounts_db_rent.exemption_threshold == 1.0);
 }
 
 #[test]
@@ -12263,20 +12166,20 @@ fn test_genesis_deprecate_rent_exemption_disabled() {
 
     assert_eq!(accounts_db_rent, tx_processor_rent);
     assert_eq!(accounts_db_rent, rent_collector_rent);
-    assert!(accounts_db_rent.exemption_threshold == 2.0);
 }
 
 #[test]
 fn test_parent_block_id() {
     // Setup parent bank and populate block ID.
     let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
-    let parent_bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let parent_bank = Bank::new_for_tests(&genesis_config);
+    let (parent_bank, _bank_forks) = parent_bank.wrap_with_bank_forks_for_tests();
     let parent_block_id = Some(Hash::new_unique());
     parent_bank.set_block_id(parent_block_id);
 
     // Create child from parent and ensure parent block ID links back to the
     // expected value.
-    let child_bank = Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1);
+    let child_bank = Bank::new_from_parent(parent_bank, SlotLeader::new_unique(), 1);
     assert_eq!(parent_block_id, child_bank.parent_block_id());
 }
 
@@ -12407,10 +12310,295 @@ fn test_bpf_loader_upgradeable_deploy_with_more_than_255_accounts() {
         .unwrap(),
         Some(&payer_keypair.pubkey()),
     );
-    assert!(bank_client
-        .send_and_confirm_message(
-            &[&payer_keypair, &program_keypair, &upgrade_authority_keypair],
-            message
+    assert!(
+        bank_client
+            .send_and_confirm_message(
+                &[&payer_keypair, &program_keypair, &upgrade_authority_keypair],
+                message
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn test_temporary_account_execute_and_commit() {
+    // Create 2 transactions that we will execute and commit in a single batch.
+    // Transaction 1: fund account B from account A
+    // Transaction 2: use account B to pay fees for transaction (draining B)
+    // In this scenario, account B is a temporary account and should not exist
+    // after the batch has executed.
+
+    let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.activate_feature(&feature_set::relax_intrabatch_account_locks::ID);
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
+    let temp_account_keypair = Keypair::new();
+    let temp_account_pubkey = temp_account_keypair.pubkey();
+    let payer_keypair = Keypair::new();
+    let payer_pubkey = payer_keypair.pubkey();
+    let initial_payer_balance = 10 * LAMPORTS_PER_SOL;
+
+    bank.store_account(
+        &payer_pubkey,
+        &AccountSharedData::new(initial_payer_balance, 0, &system_program::id()),
+    );
+    let temp_account_rent = bank.get_minimum_balance_for_rent_exemption(0);
+    let fee_amount = fee_calculator.lamports_per_signature;
+    let transfer_amount = temp_account_rent + 10_000;
+    let tx1 = {
+        let instruction = system_instruction::create_account(
+            &payer_pubkey,
+            &temp_account_pubkey,
+            transfer_amount,
+            0,
+            &system_program::id(),
+        );
+        let message = Message::new(&[instruction], Some(&payer_pubkey));
+        Transaction::new(
+            &[&payer_keypair, &temp_account_keypair],
+            message,
+            bank.last_blockhash(),
         )
-        .is_err());
+    };
+    let tx1 = RuntimeTransaction::from_transaction_for_tests(tx1);
+    let tx2 = {
+        let instruction = system_instruction::transfer(
+            &temp_account_pubkey,
+            &Pubkey::new_unique(),
+            transfer_amount.checked_sub(fee_amount).unwrap(), // drain temp account
+        );
+        let message = Message::new(&[instruction], Some(&temp_account_pubkey));
+        Transaction::new(&[&temp_account_keypair], message, bank.last_blockhash())
+    };
+    let tx2 = RuntimeTransaction::from_transaction_for_tests(tx2);
+    let txs = vec![tx1, tx2];
+    let batch = bank.prepare_sanitized_batch(&txs);
+
+    let (commit_results, _) = bank.load_execute_and_commit_transactions(
+        &batch,
+        ExecutionRecordingConfig::default(),
+        &mut ExecuteTimings::default(),
+        None,
+    );
+
+    assert_eq!(commit_results.len(), 2);
+    assert!(commit_results[0].is_ok());
+    assert!(commit_results[1].is_ok());
+
+    // Verify temporary account no longer exists (i.e. zero lamports)
+    assert_eq!(bank.get_balance(&temp_account_pubkey), 0);
+}
+
+#[test]
+fn test_temporary_account_recreated_execute_and_commit() {
+    // Create 3 transactions that we will execute and commit in a single batch.
+    // Transaction 1: fund account B from account A
+    // Transaction 2: use account B to pay fees for transaction (draining B)
+    // Transaction 3: fund account B from account A again
+    // In this scenario, account B is a temporary account and is removed, but
+    // re-created in the final transaction and should be present in final state.
+
+    let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.activate_feature(&feature_set::relax_intrabatch_account_locks::ID);
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
+    let temp_account_keypair = Keypair::new();
+    let temp_account_pubkey = temp_account_keypair.pubkey();
+    let payer_keypair = Keypair::new();
+    let payer_pubkey = payer_keypair.pubkey();
+    let initial_payer_balance = 10 * LAMPORTS_PER_SOL;
+
+    bank.store_account(
+        &payer_pubkey,
+        &AccountSharedData::new(initial_payer_balance, 0, &system_program::id()),
+    );
+    let temp_account_rent = bank.get_minimum_balance_for_rent_exemption(0);
+    let fee_amount = fee_calculator.lamports_per_signature;
+    let transfer_amount = temp_account_rent + 10_000;
+    let tx1 = {
+        let instruction = system_instruction::create_account(
+            &payer_pubkey,
+            &temp_account_pubkey,
+            transfer_amount,
+            0,
+            &system_program::id(),
+        );
+        let message = Message::new(&[instruction], Some(&payer_pubkey));
+        Transaction::new(
+            &[&payer_keypair, &temp_account_keypair],
+            message,
+            bank.last_blockhash(),
+        )
+    };
+    let tx1 = RuntimeTransaction::from_transaction_for_tests(tx1);
+    let tx2 = {
+        let instruction = system_instruction::transfer(
+            &temp_account_pubkey,
+            &Pubkey::new_unique(),
+            transfer_amount.checked_sub(fee_amount).unwrap(), // drain temp account
+        );
+        let message = Message::new(&[instruction], Some(&temp_account_pubkey));
+        Transaction::new(&[&temp_account_keypair], message, bank.last_blockhash())
+    };
+    let tx2 = RuntimeTransaction::from_transaction_for_tests(tx2);
+    let tx3 = {
+        let instruction = system_instruction::create_account(
+            &payer_pubkey,
+            &temp_account_pubkey,
+            transfer_amount - 1, // fund temp account again with different amount
+            0,
+            &system_program::id(),
+        );
+        let message = Message::new(&[instruction], Some(&payer_pubkey));
+        Transaction::new(
+            &[&payer_keypair, &temp_account_keypair],
+            message,
+            bank.last_blockhash(),
+        )
+    };
+    let tx3 = RuntimeTransaction::from_transaction_for_tests(tx3);
+    let txs = vec![tx1, tx2, tx3];
+    let batch = bank.prepare_sanitized_batch(&txs);
+
+    let (commit_results, _) = bank.load_execute_and_commit_transactions(
+        &batch,
+        ExecutionRecordingConfig::default(),
+        &mut ExecuteTimings::default(),
+        None,
+    );
+
+    assert_eq!(commit_results.len(), 3);
+    assert!(commit_results[0].is_ok());
+    assert!(commit_results[1].is_ok());
+    assert!(commit_results[2].is_ok());
+
+    // Verify account exists with correct balance
+    assert_eq!(bank.get_balance(&temp_account_pubkey), transfer_amount - 1);
+}
+
+/// Test that when loading a bank from snapshot, the rent in the rent collector
+/// is set from the rent sysvar account, not from the serialized bank fields.
+#[test]
+fn test_new_from_snapshot_uses_rent_from_sysvar() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+    let expected_rent = genesis_config.rent.clone();
+    let wrong_rent = Rent {
+        lamports_per_byte: expected_rent.lamports_per_byte + 999_999,
+        ..Rent::default()
+    };
+
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.rent_collector.rent = wrong_rent.clone();
+    bank.set_block_id(Some(Hash::default()));
+
+    // Serialize bank to snapshot
+    let snapshot_storages = bank.get_snapshot_storages(None);
+    let mut buf = vec![];
+    crate::serde_snapshot::bank_to_stream(
+        &mut std::io::BufWriter::new(Cursor::new(&mut buf)),
+        &bank,
+        &snapshot_storages,
+    )
+    .unwrap();
+
+    // Deserialize fields and corrupt the rent
+    let mut reader = std::io::BufReader::new(Cursor::new(&buf));
+    let (mut fields, _accounts_db_fields) = fields_from_stream(&mut reader).unwrap();
+    let epoch_stakes = std::mem::take(&mut fields.versioned_epoch_stakes)
+        .into_iter()
+        .map(|(epoch, stakes)| (epoch, stakes.into()))
+        .collect();
+
+    // Reconstruct bank from corrupted fields
+    let new_bank = Bank::new_from_snapshot(
+        BankRc {
+            accounts: Arc::clone(&bank.rc.accounts),
+            parent: RwLock::new(None),
+            bank_id_generator: Arc::clone(&bank.rc.bank_id_generator),
+        },
+        &genesis_config,
+        Arc::new(RuntimeConfig::default()),
+        fields,
+        Some(bank.leader),
+        None,
+        bank.load_accounts_data_size(),
+        epoch_stakes,
+    );
+
+    // Verify the bank's rent matches the sysvar, NOT the corrupted fields
+    assert_eq!(new_bank.rent_collector.rent, expected_rent);
+    assert_ne!(new_bank.rent_collector.rent, wrong_rent);
+}
+
+#[test]
+fn test_calculate_and_set_block_id_for_dcou() {
+    // scenario 1: block id already set
+    {
+        let bank = create_simple_test_bank(123);
+        let block_id = Hash::new_unique();
+        bank.set_block_id(Some(block_id));
+        Bank::calculate_and_set_block_id_for_dcou(&bank);
+        assert_eq!(bank.block_id(), Some(block_id));
+    }
+
+    // scenario 2: block id unset
+    {
+        let (genesis_config, _) = create_genesis_config(123);
+        let (bank1, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let block_id1 = Hash::new_unique();
+        // oldest ancestor must have block_id set
+        bank1.set_block_id(Some(block_id1));
+        bank1.fill_bank_with_ticks_for_tests();
+
+        let bank2 = new_from_parent(bank1);
+        Bank::calculate_and_set_block_id_for_dcou(&bank2);
+
+        // ensure expected block_id is correct
+        assert_eq!(
+            bank2.block_id(),
+            Some(hashv(&[block_id1.as_ref(), bank2.hash().as_ref()])),
+        );
+    }
+
+    // scenario 3: block id unset, multiple parents
+    {
+        let (genesis_config, _) = create_genesis_config(123);
+        let (mut bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        // oldest ancestor must have block id set
+        bank.set_block_id(Some(Hash::new_unique()));
+        for _ in 0..7 {
+            bank.fill_bank_with_ticks_for_tests();
+            bank = Arc::new(new_from_parent(bank));
+        }
+
+        Bank::calculate_and_set_block_id_for_dcou(&bank);
+
+        // we don't calculate the expected parent block id
+        // out-of-band, since scenario 2 covers that
+        assert_eq!(
+            bank.block_id(),
+            Some(hashv(&[
+                bank.parent_block_id().unwrap().as_ref(),
+                bank.hash().as_ref(),
+            ])),
+        );
+    }
+
+    // scenario 4: no parent
+    {
+        let bank = create_simple_test_bank(123);
+        assert!(bank.parent().is_none());
+        assert!(bank.block_id().is_none());
+
+        // must freeze() to ensure bank hash is calculated
+        bank.freeze();
+        let expected_block_id = bank.hash();
+
+        Bank::calculate_and_set_block_id_for_dcou(&bank);
+        assert_eq!(bank.block_id(), Some(expected_block_id));
+    }
 }

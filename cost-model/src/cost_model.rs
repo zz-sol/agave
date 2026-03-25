@@ -16,8 +16,8 @@ use {
     solana_sdk_ids::system_program,
     solana_svm_transaction::{instruction::SVMInstruction, svm_message::SVMStaticMessage},
     solana_system_interface::{
-        instruction::SystemInstruction, MAX_PERMITTED_ACCOUNTS_DATA_ALLOCATIONS_PER_TRANSACTION,
-        MAX_PERMITTED_DATA_LENGTH,
+        MAX_PERMITTED_ACCOUNTS_DATA_ALLOCATIONS_PER_TRANSACTION, MAX_PERMITTED_DATA_LENGTH,
+        instruction::SystemInstruction,
     },
     std::num::Saturating,
 };
@@ -36,7 +36,9 @@ impl CostModel {
         transaction: &'a Tx,
         feature_set: &FeatureSet,
     ) -> TransactionCost<'a, Tx> {
-        if transaction.is_simple_vote_transaction() {
+        let remove_simple_vote_from_cost_model =
+            feature_set.is_active(&feature_set::remove_simple_vote_from_cost_model::id());
+        if transaction.is_simple_vote_transaction() && !remove_simple_vote_from_cost_model {
             TransactionCost::SimpleVote { transaction }
         } else {
             let (programs_execution_cost, loaded_accounts_data_size_cost) =
@@ -62,7 +64,9 @@ impl CostModel {
         actual_loaded_accounts_data_size_bytes: u32,
         feature_set: &FeatureSet,
     ) -> TransactionCost<'a, Tx> {
-        if transaction.is_simple_vote_transaction() {
+        let remove_simple_vote_from_cost_model =
+            feature_set.is_active(&feature_set::remove_simple_vote_from_cost_model::id());
+        if transaction.is_simple_vote_transaction() && !remove_simple_vote_from_cost_model {
             TransactionCost::SimpleVote { transaction }
         } else {
             let loaded_accounts_data_size_cost = Self::calculate_loaded_accounts_data_size_cost(
@@ -93,7 +97,9 @@ impl CostModel {
         num_write_locks: u64,
         feature_set: &FeatureSet,
     ) -> TransactionCost<'a, Tx> {
-        if transaction.is_simple_vote_transaction() {
+        let remove_simple_vote_from_cost_model =
+            feature_set.is_active(&feature_set::remove_simple_vote_from_cost_model::id());
+        if transaction.is_simple_vote_transaction() && !remove_simple_vote_from_cost_model {
             return TransactionCost::SimpleVote { transaction };
         }
         let (programs_execution_cost, loaded_accounts_data_size_cost) =
@@ -119,7 +125,7 @@ impl CostModel {
         data_bytes_cost: u16,
         feature_set: &FeatureSet,
     ) -> TransactionCost<'a, Tx> {
-        let signature_cost = Self::get_signature_cost(transaction, feature_set);
+        let signature_cost = Self::get_signature_cost(transaction);
         let write_lock_cost = Self::get_write_lock_cost(num_write_locks);
 
         let allocated_accounts_data_size =
@@ -139,17 +145,8 @@ impl CostModel {
     }
 
     /// Returns signature details and the total signature cost
-    fn get_signature_cost(transaction: &impl StaticMeta, feature_set: &FeatureSet) -> u64 {
+    fn get_signature_cost(transaction: &impl StaticMeta) -> u64 {
         let signatures_count_detail = transaction.signature_details();
-
-        let ed25519_verify_cost = ED25519_VERIFY_STRICT_COST;
-
-        let secp256r1_verify_cost =
-            if feature_set.is_active(&feature_set::enable_secp256r1_precompile::id()) {
-                SECP256R1_VERIFY_COST
-            } else {
-                0
-            };
 
         signatures_count_detail
             .num_transaction_signatures()
@@ -162,12 +159,12 @@ impl CostModel {
             .saturating_add(
                 signatures_count_detail
                     .num_ed25519_instruction_signatures()
-                    .saturating_mul(ed25519_verify_cost),
+                    .saturating_mul(ED25519_VERIFY_STRICT_COST),
             )
             .saturating_add(
                 signatures_count_detail
                     .num_secp256r1_instruction_signatures()
-                    .saturating_mul(secp256r1_verify_cost),
+                    .saturating_mul(SECP256R1_VERIFY_COST),
             )
     }
 
@@ -329,7 +326,7 @@ mod tests {
         solana_hash::Hash,
         solana_instruction::Instruction,
         solana_keypair::Keypair,
-        solana_message::{compiled_instruction::CompiledInstruction, Message},
+        solana_message::{Message, compiled_instruction::CompiledInstruction},
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk_ids::{compute_budget, system_program},
         solana_signer::Signer,

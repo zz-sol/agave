@@ -46,7 +46,15 @@ impl<'a> StorableAccounts<'a> for (Slot, &'a [StakeReward]) {
         mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
     ) -> Ret {
         let entry = &self.1[index];
-        callback((&self.1[index].stake_pubkey, &entry.stake_account).into())
+        callback((&entry.stake_pubkey, &entry.stake_account).into())
+    }
+    fn account_for_geyser<Ret>(
+        &self,
+        index: usize,
+        mut callback: impl for<'local> FnMut(&'local Pubkey, &'local AccountSharedData) -> Ret,
+    ) -> Ret {
+        let entry = &self.1[index];
+        callback(&entry.stake_pubkey, &entry.stake_account)
     }
     fn is_zero_lamport(&self, index: usize) -> bool {
         self.1[index].is_zero_lamport()
@@ -72,7 +80,7 @@ impl<'a> StorableAccounts<'a> for (Slot, &'a [StakeReward]) {
 #[cfg(feature = "dev-context-only-utils")]
 use {
     rand::Rng,
-    solana_account::{state_traits::StateMut, WritableAccount},
+    solana_account::{WritableAccount, state_traits::StateMut},
     solana_clock::Epoch,
     solana_keypair::Keypair,
     solana_rent::Rent,
@@ -88,10 +96,8 @@ use {
 // These functions/fields are only usable from a dev context (i.e. tests and benches)
 #[cfg(feature = "dev-context-only-utils")]
 impl StakeReward {
-    pub fn new_random() -> Self {
+    pub fn new_random(rent: &Rent) -> Self {
         let mut rng = rand::rng();
-
-        let rent = Rent::free();
 
         let validator_pubkey = solana_pubkey::new_rand();
         let validator_stake_lamports = 20;
@@ -110,13 +116,14 @@ impl StakeReward {
             validator_stake_lamports,
         );
 
+        let rent_exempt_reserve = rent.minimum_balance(StakeStateV2::size_of());
         let reward_lamports: i64 = rng.random_range(1..200);
         let validator_stake_account = create_stake_account(
             &validator_staking_keypair.pubkey(),
             &validator_voting_keypair.pubkey(),
             &validator_vote_account,
-            &rent,
-            validator_stake_lamports + reward_lamports as u64,
+            rent,
+            rent_exempt_reserve + validator_stake_lamports + reward_lamports as u64,
         );
 
         Self {

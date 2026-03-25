@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #![allow(rustdoc::private_intra_doc_links)]
 //! The task (transaction) scheduling code for the unified scheduler
 //!
@@ -108,9 +100,10 @@ use {
     crate::utils::{ShortCounter, Token, TokenCell},
     assert_matches::assert_matches,
     solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-    solana_transaction::{sanitized::SanitizedTransaction, Hash},
+    solana_transaction::sanitized::SanitizedTransaction,
     static_assertions::const_assert_eq,
     std::{
         cmp::Ordering,
@@ -838,11 +831,7 @@ impl UsageQueueInner {
             }
         }
 
-        if is_newly_lockable {
-            self.pop()
-        } else {
-            None
-        }
+        if is_newly_lockable { self.pop() } else { None }
     }
 
     fn push_blocked(&mut self, usage_from_task: UsageFromTask) {
@@ -995,19 +984,13 @@ impl UsageQueueInner {
                     (Some(PriorityUsage::Readonly(current_tasks)), RequestedUsage::Writable) => {
                         // First, we need to determine whether the write-requesting new_task could
                         // reblock current read-only tasks _very efficiently while bounded under
-                        // the worst case_, to prevent large number of low priority tasks from
-                        // consuming undue amount of cpu cycles for nothing.
-
-                        // Use extract_if once stablized to remove Vec creation and the repeating
-                        // remove()s...
-                        let task_indexes = current_tasks
-                            .range(new_task.task_id()..)
-                            .filter_map(|(&task_id, task)| {
-                                task.try_reblock(token).then_some(task_id)
-                            })
-                            .collect::<Vec<OrderedTaskId>>();
-                        for task_id in task_indexes.into_iter() {
-                            let reblocked_task = current_tasks.remove(&task_id).unwrap();
+                        // the worst case_, to prevent large number of incoming low priority tasks
+                        // from consuming undue amount of cpu cycles for nothing.
+                        let reblocked_tasks = current_tasks
+                            .extract_if(new_task.task_id().., |_task_id, task| {
+                                task.try_reblock(token)
+                            });
+                        for (_task_id, reblocked_task) in reblocked_tasks {
                             blocked_usages_from_tasks
                                 .insert_usage_from_task((RequestedUsage::Readonly, reblocked_task));
                         }
@@ -1019,10 +1002,10 @@ impl UsageQueueInner {
                             // In this case, new_task will still be inserted as the
                             // highest-priority blocked writable task, nevertheless any of readonly
                             // tasks are reblocked above. That's because all of such tasks should
-                            // be of lower-priority than new_task by the very `range()` lookup
+                            // be of lower-priority than new_task by the very `extract_if()` lookup
                             // above. So, the write-always-follows-read critical invariant is still
                             // intact. So is the assertion in current-and-requested-readonly
-                            // match arm.
+                            // match arm just above.
                             Err(())
                         }
                     }
@@ -1362,9 +1345,7 @@ impl SchedulingStateMachine {
         //`::validate_account_locks()` regardless of whether unified-scheduler
         // is enabled or not at the blockstore
         // (`Bank::prepare_sanitized_batch()` is called in
-        // `process_entries()`). This verification will be hoisted for
-        // optimization when removing
-        // `--block-verification-method=blockstore-processor`.
+        // `process_entries()`).
         //
         // As for `banking_stage` with unified scheduler, it will need to run
         // `validate_account_locks()` at least once somewhere in the code path.
@@ -1531,11 +1512,11 @@ mod tests {
         solana_instruction::{AccountMeta, Instruction},
         solana_message::Message,
         solana_pubkey::Pubkey,
-        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
+        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
         std::{
             cell::RefCell,
             collections::HashMap,
-            panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
+            panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
             rc::Rc,
         },
         test_case::test_matrix,

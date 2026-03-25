@@ -6,7 +6,6 @@ use {
         scheduler_messages::MaxAge,
     },
     itertools::Itertools,
-    solana_clock::MAX_PROCESSING_AGE,
     solana_fee::FeeFeatures,
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
@@ -28,6 +27,7 @@ use {
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
     solana_transaction_error::TransactionError,
+    solana_vote::vote_parser,
     std::num::Saturating,
 };
 
@@ -48,16 +48,6 @@ pub struct ExecutionFlags {
     /// failing transactions to be committed. If both flags are set then any
     /// failing transaction will cause all transactions to be aborted.
     pub all_or_nothing: bool,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for ExecutionFlags {
-    fn default() -> Self {
-        Self {
-            drop_on_failure: false,
-            all_or_nothing: false,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -95,8 +85,6 @@ pub struct ExecuteAndCommitTransactionsOutput {
     pub commit_transactions_result: Result<Vec<CommitTransactionDetails>, PohRecorderError>,
     pub(crate) execute_and_commit_timings: LeaderExecuteAndCommitTimings,
     pub(crate) error_counters: TransactionErrorMetrics,
-    pub(crate) min_prioritization_fees: u64,
-    pub(crate) max_prioritization_fees: u64,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -140,12 +128,23 @@ impl Consumer {
     ) -> ProcessTransactionBatchOutput {
         let mut error_counters = TransactionErrorMetrics::default();
         let pre_results = vec![Ok(()); txs.len()];
-        let check_results =
-            bank.check_transactions(txs, &pre_results, MAX_PROCESSING_AGE, &mut error_counters);
+        let check_results = bank.check_transactions(
+            txs,
+            &pre_results,
+            bank.max_processing_age(),
+            &mut error_counters,
+        );
         let check_results: Vec<_> = check_results
             .into_iter()
-            .map(|result| match result {
-                Ok(_) => Ok(()),
+            .zip(txs.iter())
+            .map(|(result, tx)| match result {
+                Ok(_) => {
+                    if bank.vote_only_bank() && !vote_parser::is_valid_vote_only_transaction(tx) {
+                        Err(TransactionError::SanitizeFailure)
+                    } else {
+                        Ok(())
+                    }
+                }
                 Err(err) => Err(err),
             })
             .collect();
@@ -153,7 +152,10 @@ impl Consumer {
             bank,
             txs,
             check_results.into_iter(),
-            ExecutionFlags::default(),
+            ExecutionFlags {
+                drop_on_failure: false,
+                all_or_nothing: false,
+            },
         );
 
         // Accumulate error counters from the initial checks into final results
@@ -262,20 +264,6 @@ impl Consumer {
         let transaction_status_sender_enabled = self.committer.transaction_status_sender_enabled();
         let mut execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
 
-        let min_max = batch
-            .sanitized_transactions()
-            .iter()
-            .filter_map(|transaction| {
-                transaction
-                    .compute_budget_instruction_details()
-                    .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
-                    .ok()
-                    .map(|limits| limits.compute_unit_price)
-            })
-            .minmax();
-        let (min_prioritization_fees, max_prioritization_fees) =
-            min_max.into_option().unwrap_or_default();
-
         let mut error_counters = TransactionErrorMetrics::default();
         let mut retryable_transaction_indexes: Vec<_> = batch
             .lock_results()
@@ -329,10 +317,10 @@ impl Consumer {
             })
             .collect();
 
-        let (load_and_execute_transactions_output, load_execute_us) = measure_us!(bank
-            .load_and_execute_transactions(
+        let (load_and_execute_transactions_output, load_execute_us) =
+            measure_us!(bank.load_and_execute_transactions(
                 batch,
-                MAX_PROCESSING_AGE,
+                bank.max_processing_age(),
                 &mut execute_and_commit_timings.execute_timings,
                 &mut error_counters,
                 TransactionProcessingConfig {
@@ -381,8 +369,8 @@ impl Consumer {
             attempted_processing_count: processing_results.len() as u64,
         };
 
-        let (processed_transactions, processing_results_to_transactions_us) =
-            measure_us!(processing_results
+        let (processed_transactions, processing_results_to_transactions_us) = measure_us!(
+            processing_results
                 .iter()
                 .zip(batch.sanitized_transactions())
                 .filter_map(|(processing_result, tx)| {
@@ -392,14 +380,16 @@ impl Consumer {
                         None
                     }
                 })
-                .collect_vec());
+                .collect_vec()
+        );
 
         let (freeze_lock, freeze_lock_us) = measure_us!(bank.freeze_lock());
         execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
 
-        let (record_transactions_summary, record_us) = measure_us!(self
-            .transaction_recorder
-            .record_transactions(bank.bank_id(), processed_transactions));
+        let (record_transactions_summary, record_us) = measure_us!(
+            self.transaction_recorder
+                .record_transactions(bank.bank_id(), processed_transactions)
+        );
         execute_and_commit_timings.record_us = record_us;
 
         let RecordTransactionsSummary {
@@ -434,8 +424,6 @@ impl Consumer {
                 commit_transactions_result: Err(recorder_err),
                 execute_and_commit_timings,
                 error_counters,
-                min_prioritization_fees,
-                max_prioritization_fees,
             };
         }
 
@@ -490,8 +478,6 @@ impl Consumer {
             commit_transactions_result: Ok(commit_transaction_statuses),
             execute_and_commit_timings,
             error_counters,
-            min_prioritization_fees,
-            max_prioritization_fees,
         }
     }
 
@@ -516,7 +502,6 @@ impl Consumer {
         let (mut fee_payer_account, _slot) = bank
             .rc
             .accounts
-            .accounts_db
             .load_with_fixed_root(&bank.ancestors, fee_payer)
             .ok_or(TransactionError::AccountNotFound)?;
 
@@ -538,7 +523,7 @@ mod tests {
         crate::banking_stage::tests::{create_slow_genesis_config, sanitize_transactions},
         agave_reserved_account_keys::ReservedAccountKeys,
         crossbeam_channel::unbounded,
-        solana_account::{state_traits::StateMut, AccountSharedData},
+        solana_account::{AccountSharedData, state_traits::StateMut},
         solana_address_lookup_table_interface::{
             self as address_lookup_table,
             state::{AddressLookupTable, LookupTableMeta},
@@ -548,20 +533,21 @@ mod tests {
         solana_hash::Hash,
         solana_instruction::error::InstructionError,
         solana_keypair::Keypair,
+        solana_leader_schedule::SlotLeader,
         solana_ledger::{
             blockstore_processor::{TransactionStatusMessage, TransactionStatusSender},
             genesis_utils::{
-                bootstrap_validator_stake_lamports, create_genesis_config_with_leader,
-                GenesisConfigInfo,
+                GenesisConfigInfo, bootstrap_validator_stake_lamports,
+                create_genesis_config_with_leader,
             },
         },
         solana_message::{
-            v0::{self, MessageAddressTableLookup},
             MessageHeader, VersionedMessage,
+            v0::{self, MessageAddressTableLookup},
         },
         solana_nonce::{self as nonce, state::DurableNonce},
         solana_nonce_account::verify_nonce_account,
-        solana_poh::record_channels::{record_channels, RecordReceiver},
+        solana_poh::record_channels::{RecordReceiver, record_channels},
         solana_pubkey::Pubkey,
         solana_runtime::bank_forks::BankForks,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
@@ -569,7 +555,7 @@ mod tests {
         solana_system_interface::program as system_program,
         solana_system_transaction as system_transaction,
         solana_transaction::{
-            sanitized::MessageHash, versioned::VersionedTransaction, Transaction,
+            Transaction, sanitized::MessageHash, versioned::VersionedTransaction,
         },
         std::{
             borrow::Cow,
@@ -1109,11 +1095,9 @@ mod tests {
             mint_keypair,
             ..
         } = create_slow_genesis_config(lamports);
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         // set cost tracker limits to MAX so it will not filter out TXs
-        bank.write_cost_tracker()
-            .unwrap()
-            .set_limits(u64::MAX, u64::MAX, u64::MAX);
+        bank.write_cost_tracker().unwrap().set_limits_max();
 
         // Transfer more than the balance of the mint keypair, should cause a
         // InstructionError::InsufficientFunds that is then committed.
@@ -1179,9 +1163,7 @@ mod tests {
         bank.ns_per_slot = u128::MAX;
         let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
         // set cost tracker limits to MAX so it will not filter out TXs
-        bank.write_cost_tracker()
-            .unwrap()
-            .set_limits(u64::MAX, u64::MAX, u64::MAX);
+        bank.write_cost_tracker().unwrap().set_limits_max();
 
         let mut transactions = vec![];
         let destination = Pubkey::new_unique();
@@ -1283,9 +1265,11 @@ mod tests {
         } = process_transactions_summary;
 
         // Transaction is successfully processed, but not committed due to poh recording error.
-        assert!(execute_and_commit_transactions_output
-            .commit_transactions_result
-            .is_err());
+        assert!(
+            execute_and_commit_transactions_output
+                .commit_transactions_result
+                .is_err()
+        );
         assert_eq!(
             execute_and_commit_transactions_output
                 .transaction_counts
@@ -1374,7 +1358,7 @@ mod tests {
         let commit_results = status_batch
             .commit_results
             .into_iter()
-            .map(|r| r.unwrap().status.clone())
+            .map(|r| r.unwrap().status)
             .collect::<Vec<_>>();
         assert_eq!(
             commit_results,
@@ -1408,7 +1392,7 @@ mod tests {
         let address_table_state = generate_new_address_lookup_table(None, 2);
         store_address_lookup_table(&bank, address_table_key, address_table_state);
 
-        let new_bank = Bank::new_from_parent(bank, &Pubkey::new_unique(), 2);
+        let new_bank = Bank::new_from_parent(bank, SlotLeader::new_unique(), 2);
         let bank = bank_forks
             .write()
             .unwrap()
@@ -1436,13 +1420,13 @@ mod tests {
 
         let tx = VersionedTransaction::try_new(message, &[&keypair]).unwrap();
         let sanitized_tx = RuntimeTransaction::try_create(
-            tx.clone(),
+            tx,
             MessageHash::Compute,
             Some(false),
             bank.as_ref(),
             &ReservedAccountKeys::empty_key_set(),
             bank.feature_set
-                .is_active(&agave_feature_set::static_instruction_limit::id()),
+                .is_active(&agave_feature_set::limit_instruction_accounts::id()),
         )
         .unwrap();
         let batch_transactions_inner = [&sanitized_tx]

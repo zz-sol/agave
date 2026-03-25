@@ -1,12 +1,16 @@
 use {
     crate::LEDGER_TOOL_DIRECTORY,
-    clap::{value_t, value_t_or_exit, values_t, values_t_or_exit, Arg, ArgMatches},
+    clap::{Arg, ArgMatches, value_t, value_t_or_exit, values_t, values_t_or_exit},
     log::*,
     solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig},
     solana_accounts_db::{
-        accounts_db::AccountsDbConfig,
+        accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
         accounts_file::StorageAccess,
-        accounts_index::{AccountsIndexConfig, IndexLimit, ScanFilter},
+        accounts_index::{
+            AccountsIndexConfig, DEFAULT_NUM_ENTRIES_OVERHEAD, DEFAULT_NUM_ENTRIES_TO_EVICT,
+            IndexLimit, IndexLimitThreshold, ScanFilter,
+        },
+        partitioned_rewards::PartitionedEpochRewardsConfig,
     },
     solana_clap_utils::{
         hidden_unless_forced,
@@ -81,9 +85,9 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
                 "Sets the memory limit for the accounts index. The size options will limit the \
                  accounts index memory to the specified value. E.g. \"50GB\" means the accounts \
                  index may use up to 50 GB of memory. The \"unlimited\" option keeps the entire \
-                 accounts index in memory. The \"minimal\" option reduces memory usage as much as \
-                 possible. All index entries that are not in memory are kept in the disk-backed \
-                 index. The disk-backed index has lower performance; prefer higher limits here.",
+                 accounts index in memory. All index entries that are not in memory are kept in \
+                 the disk-backed index. The disk-backed index has lower performance; prefer \
+                 higher explicit limits here.",
             ),
         Arg::with_name("accounts_db_skip_shrink")
             .long("accounts-db-skip-shrink")
@@ -147,6 +151,15 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
             .takes_value(true)
             .help("The number of ancient storages the ancient slot combining should converge to.")
             .hidden(hidden_unless_forced()),
+        Arg::with_name("no_accounts_db_snapshots_direct_io")
+            .long("no-accounts-db-snapshots-direct-io")
+            .help("Disable direct I/O use for accounts-db snapshot operations")
+            .long_help(
+                "Do *not* use direct I/O for accounts-db file operations related to snapshot \
+                 processsing. Direct I/O can improve performance by bypassing OS page cache, but \
+                 requires the file systems hosting snapshots and accounts-db directories to \
+                 support files opened with the O_DIRECT flag.",
+            ),
     ]
     .into_boxed_slice()
 }
@@ -271,18 +284,38 @@ pub fn get_accounts_db_config(
         value_t!(arg_matches, "accounts_index_initial_accounts_count", usize).ok();
     let accounts_index_limit =
         value_t!(arg_matches, "accounts_index_limit", String).unwrap_or_else(|err| err.exit());
-    let index_limit = match accounts_index_limit.as_str() {
-        "minimal" => IndexLimit::Minimal,
-        "25GB" => IndexLimit::Threshold(25_000_000_000),
-        "50GB" => IndexLimit::Threshold(50_000_000_000),
-        "100GB" => IndexLimit::Threshold(100_000_000_000),
-        "200GB" => IndexLimit::Threshold(200_000_000_000),
-        "400GB" => IndexLimit::Threshold(400_000_000_000),
-        "800GB" => IndexLimit::Threshold(800_000_000_000),
-        "unlimited" => IndexLimit::InMemOnly,
-        x => {
-            // clap will enforce only the above values are possible
-            unreachable!("invalid value given to `--accounts-index-limit`: '{x}'")
+    let index_limit = {
+        enum CliIndexLimit {
+            // deprecated in v4.1.0
+            Minimal,
+            Unlimited,
+            Threshold(u64),
+        }
+        let cli_index_limit = match accounts_index_limit.as_str() {
+            "minimal" => {
+                warn!("Using `minimal` for `--accounts-index-limit` is deprecated.");
+                CliIndexLimit::Minimal
+            }
+            "unlimited" => CliIndexLimit::Unlimited,
+            "25GB" => CliIndexLimit::Threshold(25_000_000_000),
+            "50GB" => CliIndexLimit::Threshold(50_000_000_000),
+            "100GB" => CliIndexLimit::Threshold(100_000_000_000),
+            "200GB" => CliIndexLimit::Threshold(200_000_000_000),
+            "400GB" => CliIndexLimit::Threshold(400_000_000_000),
+            "800GB" => CliIndexLimit::Threshold(800_000_000_000),
+            x => {
+                // clap will enforce only the above values are possible
+                unreachable!("invalid value given to `--accounts-index-limit`: '{x}'")
+            }
+        };
+        match cli_index_limit {
+            CliIndexLimit::Minimal => IndexLimit::Minimal,
+            CliIndexLimit::Unlimited => IndexLimit::InMemOnly,
+            CliIndexLimit::Threshold(num_bytes) => IndexLimit::Threshold(IndexLimitThreshold {
+                num_bytes,
+                num_entries_overhead: DEFAULT_NUM_ENTRIES_OVERHEAD,
+                num_entries_to_evict: DEFAULT_NUM_ENTRIES_TO_EVICT,
+            }),
         }
     };
     let accounts_index_drives = values_t!(arg_matches, "accounts_index_path", String)
@@ -328,7 +361,13 @@ pub fn get_accounts_db_config(
 
     AccountsDbConfig {
         index: Some(accounts_index_config),
+        account_indexes: None,
         bank_hash_details_dir: ledger_tool_ledger_path,
+        shrink_paths: None,
+        shrink_ratio: AccountShrinkThreshold::default(),
+        read_cache_limit_bytes: None,
+        read_cache_evict_sample_size: None,
+        write_cache_limit_bytes: None,
         ancient_append_vec_offset: value_t!(arg_matches, "accounts_db_ancient_append_vecs", i64)
             .ok(),
         ancient_storage_ideal_size: value_t!(
@@ -340,12 +379,15 @@ pub fn get_accounts_db_config(
         max_ancient_storages: value_t!(arg_matches, "accounts_db_max_ancient_storages", usize).ok(),
         exhaustively_verify_refcounts: arg_matches.is_present("accounts_db_verify_refcounts"),
         skip_initial_hash_calc: arg_matches.is_present("accounts_db_skip_initial_hash_calculation"),
+        partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
         storage_access,
         scan_filter_for_shrinking,
+        num_background_threads: None,
+        num_foreground_threads: None,
         use_registered_io_uring_buffers: resource_limits::check_memlock_limit_for_disk_io(
             solana_accounts_db::accounts_db::TOTAL_IO_URING_BUFFERS_SIZE_LIMIT,
         ),
-        ..AccountsDbConfig::default()
+        snapshots_use_direct_io: !arg_matches.is_present("no_accounts_db_snapshots_direct_io"),
     }
 }
 
