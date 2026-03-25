@@ -172,7 +172,7 @@ pub mod tests {
     use {
         super::*,
         crate::test_verify_with_alignment,
-        rand::Rng,
+        rand::{Rng, thread_rng},
         solana_keccak_hasher as keccak,
         solana_secp256k1_program::{
             DATA_START, new_secp256k1_instruction_with_signature, sign_message,
