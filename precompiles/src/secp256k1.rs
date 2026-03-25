@@ -1,5 +1,5 @@
 use {
-    agave_feature_set::{secp256k1_precompile_use_k256, FeatureSet},
+    agave_feature_set::{FeatureSet, secp256k1_precompile_use_k256},
     digest::Digest,
     k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
     solana_precompile_error::PrecompileError,
