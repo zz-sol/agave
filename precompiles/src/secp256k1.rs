@@ -172,7 +172,7 @@ pub mod tests {
     use {
         super::*,
         crate::test_verify_with_alignment,
-        rand0_7::{Rng, thread_rng},
+        rand::Rng,
         solana_keccak_hasher as keccak,
         solana_secp256k1_program::{
             DATA_START, new_secp256k1_instruction_with_signature, sign_message,
@@ -183,7 +183,8 @@ pub mod tests {
     // Remove this test when the legacy libsecp256k1 recovery path is deleted.
     #[test]
     fn test_recovery_backend_behavior_delta() {
-        let secret_key = libsecp256k1::SecretKey::random(&mut thread_rng());
+        let secret_bytes: [u8; 32] = rand::random();
+        let secret_key = libsecp256k1::SecretKey::parse(&secret_bytes).unwrap();
         let message = b"hello";
         let message_hash = {
             let mut hasher = keccak::Hasher::default();
@@ -529,7 +530,8 @@ pub mod tests {
     fn test_high_s_malleability_parity_with_and_without_k256_feature() {
         agave_logger::setup();
 
-        let secret_key = libsecp256k1::SecretKey::random(&mut thread_rng());
+        let secret_bytes: [u8; 32] = rand::random();
+        let secret_key = libsecp256k1::SecretKey::parse(&secret_bytes).unwrap();
         let public_key = libsecp256k1::PublicKey::from_secret_key(&secret_key);
         let eth_address = eth_address_from_pubkey(&public_key.serialize()[1..].try_into().unwrap());
 
