@@ -1057,7 +1057,7 @@ pub mod enable_secp256r1_precompile {
 }
 
 pub mod secp256k1_precompile_use_k256 {
-    solana_pubkey::declare_id!("HgNAvKS5GrJbV57y1r8rF1FPmMet6WxEvSnChEeuy4QY");
+    solana_pubkey::declare_id!("sk1BRtQU6D8GXphAqrQZnSJm3ajNVPPidY1NATASfwQ");
 }
 
 pub mod accounts_lt_hash {
@@ -2071,7 +2071,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         ),
         (
             secp256k1_precompile_use_k256::id(),
-            "Use k256 backend for secp256k1 precompile verification",
+            "Use k256 backend for secp256k1 precompile verification (NOTE: Agave only)",
         ),
         (
             migrate_stake_program_to_core_bpf::id(),
