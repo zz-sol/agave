@@ -1,12 +1,12 @@
 use {
     agave_feature_set::{secp256k1_precompile_use_k256, FeatureSet},
     digest::Digest,
+    k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
     solana_precompile_error::PrecompileError,
     solana_secp256k1_program::{
         eth_address_from_pubkey, SecpSignatureOffsets, HASHED_PUBKEY_SERIALIZED_SIZE,
         SIGNATURE_OFFSETS_SERIALIZED_SIZE, SIGNATURE_SERIALIZED_SIZE,
     },
-    solana_secp256k1_recover::{secp256k1_recover, Secp256k1RecoverError},
 };
 
 /// Verifies the signatures specified in the secp256k1 instruction data.
@@ -124,13 +124,20 @@ fn recover_pubkey_k256(
     recovery_id: u8,
     signature: &[u8],
 ) -> Result<[u8; 64], PrecompileError> {
-    secp256k1_recover(message_hash, recovery_id, signature)
-        .map(|pubkey| pubkey.to_bytes())
-        .map_err(|err| match err {
-            Secp256k1RecoverError::InvalidHash => PrecompileError::InvalidSignature,
-            Secp256k1RecoverError::InvalidRecoveryId => PrecompileError::InvalidRecoveryId,
-            Secp256k1RecoverError::InvalidSignature => PrecompileError::InvalidSignature,
-        })
+    let mut signature =
+        Signature::try_from(signature).map_err(|_| PrecompileError::InvalidSignature)?;
+    let mut recovery_id =
+        RecoveryId::try_from(recovery_id).map_err(|_| PrecompileError::InvalidRecoveryId)?;
+
+    if let Some(normalized_signature) = signature.normalize_s() {
+        signature = normalized_signature;
+        recovery_id = RecoveryId::new(!recovery_id.is_y_odd(), recovery_id.is_x_reduced());
+    }
+
+    let pubkey = VerifyingKey::recover_from_prehash(message_hash, &signature, recovery_id)
+        .map_err(|_| PrecompileError::InvalidSignature)?;
+    let encoded = pubkey.to_encoded_point(false);
+    Ok(encoded.as_bytes()[1..65].try_into().unwrap())
 }
 
 fn get_data_slice<'a>(
@@ -208,7 +215,7 @@ pub mod tests {
             &alt_signature_bytes,
         );
         assert!(legacy_pubkey.is_ok());
-        assert_eq!(k256_pubkey, Err(PrecompileError::InvalidSignature));
+        assert_eq!(legacy_pubkey, k256_pubkey);
 
         let invalid_recovery_id = 4;
         assert_eq!(
@@ -502,7 +509,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_malleability_rejected_when_k256_gate_enabled() {
+    fn test_malleability_accepted_when_k256_gate_enabled() {
         let secret_key = libsecp256k1::SecretKey::random(&mut thread_rng());
         let public_key = libsecp256k1::PublicKey::from_secret_key(&secret_key);
         let eth_address = eth_address_from_pubkey(&public_key.serialize()[1..].try_into().unwrap());
@@ -548,14 +555,12 @@ pub mod tests {
         let mut feature_set = FeatureSet::default();
         feature_set.activate(&secp256k1_precompile_use_k256::id(), 0);
 
-        assert_eq!(
-            test_verify_with_alignment(
-                verify,
-                &instruction_data,
-                &[&instruction_data],
-                &feature_set
-            ),
-            Err(PrecompileError::InvalidSignature),
-        );
+        test_verify_with_alignment(
+            verify,
+            &instruction_data,
+            &[&instruction_data],
+            &feature_set,
+        )
+        .unwrap();
     }
 }
