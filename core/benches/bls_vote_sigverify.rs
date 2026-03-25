@@ -6,10 +6,9 @@
 use {
     agave_votor_messages::{consensus_message::VoteMessage, vote::Vote},
     criterion::{BatchSize, Criterion, criterion_group, criterion_main},
-    rayon::{ThreadPool, ThreadPoolBuilder, iter::IntoParallelIterator},
+    rayon::{ThreadPool, ThreadPoolBuilder},
     solana_bls_signatures::{
-        HashedMessage, Keypair as BLSKeypair, PreparedHashedMessage, Pubkey as BLSPubkey,
-        VerifiablePubkey, pubkey::PubkeyProjective, signature::SignatureProjective,
+        Keypair as BLSKeypair, PreparedHashedMessage, Pubkey as BLSPubkey, VerifiablePubkey,
     },
     solana_core::bls_sigverify::{
         bls_vote_sigverify::{
@@ -21,12 +20,11 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_signer::Signer,
-    std::{collections::HashMap, hint::black_box, sync::Arc},
+    std::{hint::black_box, sync::Arc},
 };
 
 static MESSAGE_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 static BATCH_SIZES: &[usize] = &[8, 16, 32, 64, 128];
-static TOTAL_COUNTS: &[usize] = &[128, 256];
 
 fn get_thread_pool() -> ThreadPool {
     let num_threads = 4;
@@ -45,13 +43,6 @@ fn get_matrix_params() -> impl Iterator<Item = (usize, usize)> {
                 Some((batch_size, num_distinct))
             }
         })
-    })
-}
-
-fn get_cache_matrix_params() -> impl Iterator<Item = (usize, usize)> {
-    TOTAL_COUNTS.iter().flat_map(|&n| {
-        let ks = [2, n / 4, n / 2, n];
-        ks.into_iter().map(move |k| (n, k))
     })
 }
 
@@ -97,109 +88,27 @@ fn generate_test_data(num_distinct_messages: usize, batch_size: usize) -> Vec<Vo
     votes_to_verify
 }
 
-fn precompute_prepared_payloads(votes: &[VotePayload]) -> HashMap<Vote, PreparedHashedMessage> {
-    votes
-        .iter()
-        .fold(HashMap::with_capacity(votes.len()), |mut acc, vote| {
-            acc.entry(vote.vote_message.vote).or_insert_with(|| {
-                let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
-                PreparedHashedMessage::new(&payload)
-            });
-            acc
-        })
-}
-
-fn verify_votes_optimistic_with_prepared_payloads(
-    votes: &[VotePayload],
-    prepared_payloads: Option<&HashMap<Vote, PreparedHashedMessage>>,
-    thread_pool: &ThreadPool,
-) -> bool {
-    let use_cached_payloads = prepared_payloads.is_some();
-    let (signature_result, (is_single_payload, distinct_payloads, aggregate_pubkeys)) = thread_pool
-        .join(
-            || aggregate_signatures(votes),
-            || {
-                let mut grouped_votes: HashMap<&Vote, Vec<_>> = HashMap::new();
-                let mut inline_hashed_payloads: HashMap<&Vote, HashedMessage> = HashMap::new();
-                for vote in votes {
-                    grouped_votes
-                        .entry(&vote.vote_message.vote)
-                        .or_default()
-                        .push(&vote.bls_pubkey);
-
-                    if !use_cached_payloads {
-                        let payload = wincode::serialize(&vote.vote_message.vote).unwrap();
-                        let hashed_payload = HashedMessage::new(&payload);
-                        inline_hashed_payloads
-                            .entry(&vote.vote_message.vote)
-                            .or_insert(hashed_payload);
-                    }
-                }
-
-                let is_single_payload = grouped_votes.len() == 1;
-                let mut grouped_payloads: Vec<HashedMessage> =
-                    Vec::with_capacity(grouped_votes.len());
-                let mut grouped_pubkeys = Vec::with_capacity(grouped_votes.len());
-                for (vote, pubkeys) in grouped_votes {
-                    let hashed_payload = match prepared_payloads {
-                        Some(_) => {
-                            let payload = wincode::serialize(vote).unwrap();
-                            HashedMessage::new(&payload)
-                        }
-                        None => inline_hashed_payloads
-                            .remove(vote)
-                            .expect("hashed payload should be computed inline"),
-                    };
-                    grouped_payloads.push(hashed_payload);
-                    grouped_pubkeys.push(
-                        PubkeyProjective::par_aggregate(pubkeys.into_par_iter())
-                            .expect("pubkey aggregation should succeed"),
-                    );
-                }
-                (is_single_payload, grouped_payloads, grouped_pubkeys)
-            },
-        );
-
-    let Ok(aggregate_signature) = signature_result else {
-        return false;
-    };
-
-    if distinct_payloads.len() != aggregate_pubkeys.len() {
-        return false;
-    }
-
-    if is_single_payload {
-        let prepared_payload = match prepared_payloads {
-            Some(payloads) => payloads
-                .get(&votes[0].vote_message.vote)
-                .expect("precomputed payload should exist for all votes"),
-            None => {
-                let payload = wincode::serialize(&votes[0].vote_message.vote).unwrap();
-                return aggregate_pubkeys[0]
-                    .verify_signature_prepared(
-                        &aggregate_signature,
-                        &PreparedHashedMessage::new(&payload),
-                    )
-                    .is_ok();
-            }
-        };
-        aggregate_pubkeys[0]
-            .verify_signature_prepared(&aggregate_signature, prepared_payload)
-            .is_ok()
-    } else {
-        SignatureProjective::par_verify_distinct_aggregated_pre_hashed(
-            &aggregate_pubkeys,
-            &aggregate_signature,
-            &distinct_payloads,
-        )
-        .is_ok()
-    }
-}
-
 // Single Signature Verification
 // This is just for reference
 fn bench_verify_single_signature(c: &mut Criterion) {
     let mut group = c.benchmark_group("verify_single_signature");
+
+    let keypair = BLSKeypair::new();
+    let msg = b"benchmark_message_payload";
+    let sig = keypair.sign(msg);
+    let pubkey: BLSPubkey = keypair.public.into();
+
+    group.bench_function("1_item", |b| {
+        b.iter(|| {
+            let res = pubkey.verify_signature(black_box(&sig), black_box(msg));
+            black_box(res).unwrap();
+        })
+    });
+    group.finish();
+}
+
+fn bench_verify_single_signature_with_prepared_message(c: &mut Criterion) {
+    let mut group = c.benchmark_group("verify_single_signature_with_prepared_message");
 
     let keypair = BLSKeypair::new();
     let msg = b"benchmark_message_payload";
@@ -280,46 +189,6 @@ fn bench_aggregate_signatures(c: &mut Criterion) {
     group.finish();
 }
 
-// Optimistic verification with/without precomputed prepared messages.
-fn bench_verify_votes_optimistic_with_cache(c: &mut Criterion) {
-    let mut group = c.benchmark_group("verify_votes_optimistic_cache");
-    let thread_pool = get_thread_pool();
-
-    // n: total number of (pk, sig, h(msg))
-    // k: number of unique h(msg)
-    for (n, k) in get_cache_matrix_params() {
-        let votes = generate_test_data(k, n);
-        let base_label = format!("n={n}/k={k}");
-
-        let no_cache_label = format!("{base_label}/nocache_e2e");
-        group.bench_function(&no_cache_label, |b| {
-            b.iter(|| {
-                let res = verify_votes_optimistic_with_prepared_payloads(
-                    black_box(&votes),
-                    None,
-                    &thread_pool,
-                );
-                black_box(res);
-            })
-        });
-
-        // E2E cached path: includes preprocessing + grouping + multi-distinct verify.
-        let cache_label = format!("{base_label}/cached_e2e");
-        group.bench_function(&cache_label, |b| {
-            b.iter(|| {
-                let prepared_payloads = precompute_prepared_payloads(&votes);
-                let res = verify_votes_optimistic_with_prepared_payloads(
-                    black_box(&votes),
-                    Some(black_box(&prepared_payloads)),
-                    &thread_pool,
-                );
-                black_box(res);
-            })
-        });
-    }
-    group.finish();
-}
-
 // Individual Verification - verifies each signatures in parallel threads
 // Message distinctness is irrelevant.
 fn bench_verify_individual_votes(c: &mut Criterion) {
@@ -348,8 +217,8 @@ fn bench_verify_individual_votes(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_verify_single_signature,
+    bench_verify_single_signature_with_prepared_message,
     bench_verify_votes_optimistic,
-    bench_verify_votes_optimistic_with_cache,
     bench_aggregate_pubkeys,
     bench_aggregate_signatures,
     bench_verify_individual_votes

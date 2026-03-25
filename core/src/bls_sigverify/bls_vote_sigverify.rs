@@ -314,15 +314,15 @@ fn verify_individual_votes(
     votes_to_verify: Vec<VotePayload>,
     thread_pool: &ThreadPool,
 ) -> (Vec<VotePayload>, Vec<Pubkey>) {
-    let prepared_payloads: HashMap<_, _> = votes_to_verify
-        .iter()
-        .filter_map(|vote| {
-            let signed_vote = vote.vote_message.vote;
-            wincode::serialize(&signed_vote)
-                .ok()
-                .map(|payload| (signed_vote, PreparedHashedMessage::new(&payload)))
-        })
-        .collect();
+    let mut prepared_payloads = HashMap::with_capacity(votes_to_verify.len());
+    for vote in &votes_to_verify {
+        let signed_vote = vote.vote_message.vote;
+        prepared_payloads.entry(signed_vote).or_insert_with(|| {
+            let payload = wincode::serialize(&signed_vote)
+                .expect("vote serialization should succeed for signature verification");
+            PreparedHashedMessage::new(&payload)
+        });
+    }
 
     thread_pool.install(|| {
         votes_to_verify.into_par_iter().partition_map(|vote| {
