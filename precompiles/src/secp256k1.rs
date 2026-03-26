@@ -665,14 +665,19 @@ pub mod tests {
         let message_data_offset = data.len();
         data.extend(message);
 
-        let data_start = 1 + SIGNATURE_OFFSETS_SERIALIZED_SIZE;
+        let data_start = 1usize
+            .checked_add(SIGNATURE_OFFSETS_SERIALIZED_SIZE)
+            .unwrap();
+        let offset = |relative_offset: usize| {
+            u16::try_from(relative_offset.checked_add(data_start).unwrap()).unwrap()
+        };
         let offsets = SecpSignatureOffsets {
-            signature_offset: (signature_offset + data_start) as u16,
+            signature_offset: offset(signature_offset),
             signature_instruction_index: 0,
-            eth_address_offset: (eth_address_offset + data_start) as u16,
+            eth_address_offset: offset(eth_address_offset),
             eth_address_instruction_index: 0,
-            message_data_offset: (message_data_offset + data_start) as u16,
-            message_data_size: message.len() as u16,
+            message_data_offset: offset(message_data_offset),
+            message_data_size: u16::try_from(message.len()).unwrap(),
             message_instruction_index: 0,
         };
 
