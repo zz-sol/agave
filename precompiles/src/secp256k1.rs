@@ -179,6 +179,12 @@ pub mod tests {
         },
     };
 
+    const SECP256K1_ORDER: [u8; SIGNATURE_SERIALIZED_SIZE / 2] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
+    ];
+
     // Unit test.
     // Remove this test when the legacy libsecp256k1 recovery path is deleted.
     #[test]
@@ -549,10 +555,111 @@ pub mod tests {
         alt_signature.s = -alt_signature.s;
         let alt_recovery_id = libsecp256k1::RecoveryId::parse(recovery_id.serialize() ^ 1).unwrap();
 
-        let mut data: Vec<u8> = vec![];
+        let legacy_feature_set = FeatureSet::default();
+        let k256_feature_set = FeatureSet::all_enabled();
+
+        let valid_instruction = new_instruction_data(
+            &alt_signature.serialize(),
+            alt_recovery_id.serialize(),
+            &eth_address,
+            message,
+        );
+        assert_feature_parity(
+            &valid_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Ok(()),
+        );
+
+        let mut zero_r_signature = signature.serialize();
+        zero_r_signature[..32].fill(0);
+        let zero_r_instruction = new_instruction_data(
+            &zero_r_signature,
+            recovery_id.serialize(),
+            &eth_address,
+            message,
+        );
+        assert_feature_parity(
+            &zero_r_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+
+        let mut zero_s_signature = signature.serialize();
+        zero_s_signature[32..].fill(0);
+        let zero_s_instruction = new_instruction_data(
+            &zero_s_signature,
+            recovery_id.serialize(),
+            &eth_address,
+            message,
+        );
+        assert_feature_parity(
+            &zero_s_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+
+        let mut overflow_r_signature = signature.serialize();
+        overflow_r_signature[..32].copy_from_slice(&SECP256K1_ORDER);
+        let overflow_r_instruction = new_instruction_data(
+            &overflow_r_signature,
+            recovery_id.serialize(),
+            &eth_address,
+            message,
+        );
+        assert_feature_parity(
+            &overflow_r_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+
+        let mut overflow_s_signature = signature.serialize();
+        overflow_s_signature[32..].copy_from_slice(&SECP256K1_ORDER);
+        let overflow_s_instruction = new_instruction_data(
+            &overflow_s_signature,
+            recovery_id.serialize(),
+            &eth_address,
+            message,
+        );
+        assert_feature_parity(
+            &overflow_s_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+
+        let x_reduced_even_instruction =
+            new_instruction_data(&signature.serialize(), 2, &eth_address, message);
+        assert_feature_parity(
+            &x_reduced_even_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+
+        let x_reduced_odd_instruction =
+            new_instruction_data(&signature.serialize(), 3, &eth_address, message);
+        assert_feature_parity(
+            &x_reduced_odd_instruction,
+            &legacy_feature_set,
+            &k256_feature_set,
+            Err(PrecompileError::InvalidSignature),
+        );
+    }
+
+    fn new_instruction_data(
+        signature: &[u8; SIGNATURE_SERIALIZED_SIZE],
+        recovery_id: u8,
+        eth_address: &[u8; HASHED_PUBKEY_SERIALIZED_SIZE],
+        message: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
         let signature_offset = data.len();
-        data.extend(alt_signature.serialize());
-        data.push(alt_recovery_id.serialize());
+        data.extend(signature);
+        data.push(recovery_id);
         let eth_address_offset = data.len();
         data.extend(eth_address);
         let message_data_offset = data.len();
@@ -569,30 +676,35 @@ pub mod tests {
             message_instruction_index: 0,
         };
 
-        let mut instruction_data: Vec<u8> = vec![1];
+        let mut instruction_data = vec![1];
         instruction_data.extend(bincode::serialize(&offsets).unwrap());
         instruction_data.extend(data);
+        instruction_data
+    }
 
-        let legacy_feature_set = FeatureSet::default();
-        let k256_feature_set = FeatureSet::all_enabled();
-
+    fn assert_feature_parity(
+        instruction_data: &[u8],
+        legacy_feature_set: &FeatureSet,
+        k256_feature_set: &FeatureSet,
+        expected: Result<(), PrecompileError>,
+    ) {
         assert_eq!(
             test_verify_with_alignment(
                 verify,
-                &instruction_data,
-                &[&instruction_data],
-                &legacy_feature_set,
+                instruction_data,
+                &[instruction_data],
+                legacy_feature_set,
             ),
-            Ok(())
+            expected
         );
         assert_eq!(
             test_verify_with_alignment(
                 verify,
-                &instruction_data,
-                &[&instruction_data],
-                &k256_feature_set,
+                instruction_data,
+                &[instruction_data],
+                k256_feature_set,
             ),
-            Ok(())
+            expected
         );
     }
 }

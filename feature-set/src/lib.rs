@@ -1238,10 +1238,6 @@ pub mod enable_secp256r1_precompile {
     solana_pubkey::declare_id!("srremy31J5Y25FrAApwVb9kZcfXbusYMMsvTK9aWv5q");
 }
 
-pub mod secp256k1_precompile_use_k256 {
-    solana_pubkey::declare_id!("sk1BRtQU6D8GXphAqrQZnSJm3ajNVPPidY1NATASfwQ");
-}
-
 pub mod accounts_lt_hash {
     solana_pubkey::declare_id!("LTHasHQX6661DaDD4S6A2TFi6QBuiwXKv66fB1obfHq");
 }
@@ -1515,6 +1511,10 @@ pub mod upgrade_bpf_stake_program_to_v5 {
     pub mod buffer {
         solana_pubkey::declare_id!("4EBQBjw1kqF1dqUBb6fc5Ji4tCEQgNf9ESGGX3smwXwh");
     }
+}
+
+pub mod secp256k1_precompile_use_k256 {
+    solana_pubkey::declare_id!("sk1BRtQU6D8GXphAqrQZnSJm3ajNVPPidY1NATASfwQ");
 }
 
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
@@ -2340,10 +2340,6 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0075: Enable secp256r1 precompile",
         ),
         (
-            secp256k1_precompile_use_k256::id(),
-            "Use k256 backend for secp256k1 precompile verification (NOTE: Agave only)",
-        ),
-        (
             migrate_stake_program_to_core_bpf::id(),
             "SIMD-0196: Migrate Stake program to Core BPF #3655",
         ),
@@ -2560,6 +2556,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             upgrade_bpf_stake_program_to_v5::id(),
             "SIMD-0490: Upgrade BPF Stake Program to v5.0.0",
+        ),
+        (
+            secp256k1_precompile_use_k256::id(),
+            "Use k256 backend for secp256k1 precompile verification (NOTE: Agave only)",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
