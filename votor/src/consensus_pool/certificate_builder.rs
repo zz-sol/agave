@@ -275,7 +275,7 @@ mod tests {
             vote::Vote,
         },
         solana_bls_signatures::{
-            Keypair as BLSKeypair, PreparedHashedMessage, PubkeyProjective as BLSPubkeyProjective,
+            Keypair as BLSKeypair, PubkeyProjective as BLSPubkeyProjective,
             Signature as BLSSignature, SignatureProjective, VerifiablePubkey,
         },
         solana_hash::Hash,
@@ -483,10 +483,9 @@ mod tests {
         // 3. Verification: Aggregate the public keys and verify the signature.
         let aggregate_pubkey = BLSPubkeyProjective::aggregate(keypairs.iter().map(|kp| &kp.public))
             .expect("Failed to aggregate public keys");
-        let prepared_vote = PreparedHashedMessage::new(&serialized_vote);
 
         aggregate_pubkey
-            .verify_signature_prepared(&certificate_message.signature, &prepared_vote)
+            .verify_signature(&certificate_message.signature, &serialized_vote)
             .expect("BLS aggregate signature verification failed for base2 encoded certificate");
     }
 
@@ -555,17 +554,15 @@ mod tests {
             }
         }
 
-        let prepared_notarize_vote = PreparedHashedMessage::new(&serialized_notarize_vote);
-        let prepared_fallback_vote = PreparedHashedMessage::new(&serialized_fallback_vote);
-        let prepared_messages: Vec<_> = (0..3)
-            .map(|_| prepared_notarize_vote.clone())
-            .chain((0..3).map(|_| prepared_fallback_vote.clone()))
+        let messages: Vec<_> = (0..3)
+            .map(|_| serialized_notarize_vote.as_slice())
+            .chain((0..3).map(|_| serialized_fallback_vote.as_slice()))
             .collect();
 
-        SignatureProjective::verify_distinct_aggregated_prepared(
+        SignatureProjective::verify_distinct_aggregated(
             all_pubkeys.iter(),
             &certificate_message.signature,
-            prepared_messages.iter(),
+            messages.into_iter(),
         )
         .unwrap();
     }
