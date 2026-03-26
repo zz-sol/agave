@@ -48,9 +48,7 @@ impl VotePayload {
         self,
         prepared_payloads: &HashMap<Vote, PreparedHashedMessage>,
     ) -> Option<Self> {
-        let prepared_payload = prepared_payloads
-            .get(&self.vote_message.vote)
-            .expect("prepared payload must exist for every vote being individually verified");
+        let prepared_payload = prepared_payloads.get(&self.vote_message.vote)?;
         self.bls_pubkey
             .verify_signature_prepared(&self.vote_message.signature, prepared_payload)
             .is_ok()
