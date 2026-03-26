@@ -108,7 +108,6 @@ solana-pubkey = { workspace = true, features = ["rand"] }
 solana-rent = { workspace = true }
 solana-sbpf = { workspace = true, features = ["jit"] }
 solana-secp256k1-program = { workspace = true, features = ["bincode"] }
-solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
@@ -121,6 +120,12 @@ solana-transaction = { workspace = true, features = ["dev-context-only-utils"] }
 solana-transaction-context = { path = "../transaction-context", features = ["agave-unstable-api", "bincode", "dev-context-only-utils"] }
 spl-token-interface = { workspace = true }
 test-case = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+solana-secp256r1-program = { workspace = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 
 [lints]
 workspace = true
