@@ -354,7 +354,7 @@ mod tests {
             }));
             assert!(result.is_err());
         } else {
-            assert!(aggregate_signatures(&votes).is_ok());
+            aggregate_signatures(&votes).unwrap();
         }
     }
 
