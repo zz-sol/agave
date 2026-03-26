@@ -44,7 +44,11 @@ pub(super) struct VotePayload {
 }
 
 impl VotePayload {
-    fn verify_prepared(self, prepared_payload: &PreparedHashedMessage) -> Option<Self> {
+    fn verify_prepared(
+        self,
+        prepared_payloads: &HashMap<Vote, PreparedHashedMessage>,
+    ) -> Option<Self> {
+        let prepared_payload = prepared_payloads.get(&self.vote_message.vote)?;
         self.bls_pubkey
             .verify_signature_prepared(&self.vote_message.signature, prepared_payload)
             .is_ok()
@@ -327,10 +331,7 @@ fn verify_individual_votes(
     thread_pool.install(|| {
         votes_to_verify.into_par_iter().partition_map(|vote| {
             let remote_pubkey = vote.remote_pubkey;
-            match prepared_payloads
-                .get(&vote.vote_message.vote)
-                .and_then(|prepared_payload| vote.verify_prepared(prepared_payload))
-            {
+            match vote.verify_prepared(&prepared_payloads) {
                 Some(vote) => Either::Left(vote),
                 None => Either::Right(remote_pubkey),
             }
