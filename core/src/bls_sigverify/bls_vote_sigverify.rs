@@ -48,9 +48,8 @@ pub(super) struct VotePayload {
 impl VotePayload {
     fn verify(self) -> Option<Self> {
         let payload = wincode::serialize(&self.vote_message.vote).ok()?;
-        let prepared_payload = PreparedHashedMessage::new(&payload);
         self.bls_pubkey
-            .verify_signature_prepared(&self.vote_message.signature, &prepared_payload)
+            .verify_signature(&self.vote_message.signature, &payload)
             .is_ok()
             .then_some(self)
     }
