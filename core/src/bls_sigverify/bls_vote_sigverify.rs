@@ -33,6 +33,8 @@ use {
     std::collections::HashMap,
 };
 
+const PREPARED_PAYLOAD_CACHE_DISTINCT_VOTE_THRESHOLD_PERCENT: usize = 90;
+
 /// [`VoteMessage`] along with other information needed to sig verify it.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 #[derive(Clone, Debug)]
@@ -44,6 +46,15 @@ pub(super) struct VotePayload {
 }
 
 impl VotePayload {
+    fn verify(self) -> Option<Self> {
+        let payload = wincode::serialize(&self.vote_message.vote).ok()?;
+        let prepared_payload = PreparedHashedMessage::new(&payload);
+        self.bls_pubkey
+            .verify_signature_prepared(&self.vote_message.signature, &prepared_payload)
+            .is_ok()
+            .then_some(self)
+    }
+
     fn verify_prepared(
         self,
         prepared_payloads: &HashMap<Vote, PreparedHashedMessage>,
@@ -185,13 +196,18 @@ fn verify_votes(
     stats.too_far_in_future = stats.too_far_in_future.saturating_add(num_discarded as u64);
 
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
-    if verify_votes_optimistic(&votes_to_verify, stats, thread_pool) {
+    let (optimistic_verified, distinct_vote_count) =
+        verify_votes_optimistic(&votes_to_verify, stats, thread_pool);
+    if optimistic_verified {
         return votes_to_verify;
     }
 
     // Fallback to individual verification
-    let ((verified_votes, invalid_remote_pubkeys), time_us) =
-        measure_us!(verify_individual_votes(votes_to_verify, thread_pool));
+    let ((verified_votes, invalid_remote_pubkeys), time_us) = measure_us!(verify_individual_votes(
+        votes_to_verify,
+        distinct_vote_count,
+        thread_pool,
+    ));
     for remote_pubkey in invalid_remote_pubkeys {
         banlist.ban(remote_pubkey, BAN_TIMEOUT);
     }
@@ -205,7 +221,7 @@ fn verify_votes_optimistic(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
     thread_pool: &ThreadPool,
-) -> bool {
+) -> (bool, usize) {
     let mut measure = Measure::start("verify_votes_optimistic");
 
     // For BLS verification, minimizing the expensive pairing operation is key.
@@ -223,11 +239,13 @@ fn verify_votes_optimistic(
     );
 
     let Ok(aggregate_signature) = signature_result else {
-        return false;
+        return (false, 0);
     };
 
+    let distinct_vote_count = distinct_payloads.len();
+
     let Ok(aggregate_pubkeys) = pubkeys_result else {
-        return false;
+        return (false, distinct_vote_count);
     };
 
     let verified = if distinct_payloads.len() == 1 {
@@ -253,7 +271,7 @@ fn verify_votes_optimistic(
     stats
         .fn_verify_votes_optimistic_stats
         .add_sample(measure.as_us());
-    verified
+    (verified, distinct_vote_count)
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -316,6 +334,31 @@ fn aggregate_pubkeys_by_payload(
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn verify_individual_votes(
     votes_to_verify: Vec<VotePayload>,
+    distinct_vote_count: usize,
+    thread_pool: &ThreadPool,
+) -> (Vec<VotePayload>, Vec<Pubkey>) {
+    if should_prepare_payload_cache(distinct_vote_count, votes_to_verify.len()) {
+        return verify_individual_votes_with_payload_cache(votes_to_verify, thread_pool);
+    }
+
+    thread_pool.install(|| {
+        votes_to_verify.into_par_iter().partition_map(|vote| {
+            let remote_pubkey = vote.remote_pubkey;
+            match vote.verify() {
+                Some(vote) => Either::Left(vote),
+                None => Either::Right(remote_pubkey),
+            }
+        })
+    })
+}
+
+fn should_prepare_payload_cache(distinct_vote_count: usize, total_vote_count: usize) -> bool {
+    distinct_vote_count.saturating_mul(100)
+        <= total_vote_count.saturating_mul(PREPARED_PAYLOAD_CACHE_DISTINCT_VOTE_THRESHOLD_PERCENT)
+}
+
+fn verify_individual_votes_with_payload_cache(
+    votes_to_verify: Vec<VotePayload>,
     thread_pool: &ThreadPool,
 ) -> (Vec<VotePayload>, Vec<Pubkey>) {
     let mut prepared_payloads = HashMap::with_capacity(votes_to_verify.len());
@@ -343,6 +386,16 @@ fn verify_individual_votes(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn test_should_prepare_payload_cache() {
+        assert!(should_prepare_payload_cache(9, 10));
+        assert!(should_prepare_payload_cache(0, 0));
+        assert!(!should_prepare_payload_cache(1, 1));
+        assert!(!should_prepare_payload_cache(10, 10));
+        assert!(!should_prepare_payload_cache(91, 100));
+        assert!(should_prepare_payload_cache(90, 100));
+    }
 
     #[test]
     #[should_panic]
