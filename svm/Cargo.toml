@@ -83,6 +83,12 @@ solana-transaction-error = { workspace = true }
 spl-generic-token = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+solana-secp256r1-program = { workspace = true }
+
 [dev-dependencies]
 assert_matches = { workspace = true }
 bincode = { workspace = true }
@@ -120,12 +126,6 @@ solana-transaction = { workspace = true, features = ["dev-context-only-utils"] }
 solana-transaction-context = { path = "../transaction-context", features = ["agave-unstable-api", "bincode", "dev-context-only-utils"] }
 spl-token-interface = { workspace = true }
 test-case = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-solana-secp256r1-program = { workspace = true }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 
 [lints]
 workspace = true
