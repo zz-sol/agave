@@ -204,7 +204,7 @@ fn bench_verify_individual_votes(c: &mut Criterion) {
             b.iter_batched(
                 || votes.clone(),
                 |votes| {
-                    let res = verify_individual_votes(black_box(votes), &thread_pool);
+                    let res = verify_individual_votes(black_box(votes), 1, &thread_pool);
                     black_box(res);
                 },
                 BatchSize::SmallInput,
