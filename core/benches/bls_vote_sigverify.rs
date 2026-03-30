@@ -82,6 +82,7 @@ fn generate_test_data(num_distinct_messages: usize, batch_size: usize) -> Vec<Vo
             bls_pubkey: bls_keypair.public,
             pubkey: Keypair::new().pubkey(),
             remote_pubkey: Keypair::new().pubkey(),
+            prepared_payload: None,
         });
     }
 
@@ -100,6 +101,8 @@ fn bench_verify_single_signature(c: &mut Criterion) {
 
     group.bench_function("1_item", |b| {
         b.iter(|| {
+            // We use the raw verify method from the underlying library
+            // to establish the cryptographic floor.
             let res = pubkey.verify_signature(black_box(&sig), black_box(msg));
             black_box(res).unwrap();
         })
@@ -160,7 +163,7 @@ fn bench_aggregate_pubkeys(c: &mut Criterion) {
         group.bench_function(&label, |b| {
             b.iter(|| {
                 let res = aggregate_pubkeys_by_payload(black_box(&votes), &mut stats);
-                black_box(res).1.unwrap();
+                black_box(res).2.unwrap();
             })
         });
     }
@@ -204,7 +207,8 @@ fn bench_verify_individual_votes(c: &mut Criterion) {
             b.iter_batched(
                 || votes.clone(),
                 |votes| {
-                    let res = verify_individual_votes(black_box(votes), 1, &thread_pool);
+                    let res =
+                        verify_individual_votes(black_box(votes), vec![], vec![], &thread_pool);
                     black_box(res);
                 },
                 BatchSize::SmallInput,

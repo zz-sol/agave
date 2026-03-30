@@ -30,9 +30,11 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_streamer::nonblocking::simple_qos::SimpleQosBanlist,
-    std::collections::HashMap,
+    std::{collections::HashMap, sync::Arc},
 };
 
+/// This is the percentage threshold of distinct votes among the total votes under which we will prepare a cache of
+/// prepared payloads for individual verification.
 const PREPARED_PAYLOAD_CACHE_DISTINCT_VOTE_THRESHOLD_PERCENT: usize = 90;
 
 /// [`VoteMessage`] along with other information needed to sig verify it.
@@ -43,26 +45,22 @@ pub(super) struct VotePayload {
     pub bls_pubkey: BlsPubkeyAffine,
     pub pubkey: Pubkey,
     pub remote_pubkey: Pubkey,
+    pub prepared_payload: Option<Arc<PreparedHashedMessage>>,
 }
 
 impl VotePayload {
     fn verify(self) -> Option<Self> {
-        let payload = wincode::serialize(&self.vote_message.vote).ok()?;
-        self.bls_pubkey
-            .verify_signature(&self.vote_message.signature, &payload)
-            .is_ok()
-            .then_some(self)
-    }
-
-    fn verify_prepared(
-        self,
-        prepared_payloads: &HashMap<Vote, PreparedHashedMessage>,
-    ) -> Option<Self> {
-        let prepared_payload = prepared_payloads.get(&self.vote_message.vote)?;
-        self.bls_pubkey
-            .verify_signature_prepared(&self.vote_message.signature, prepared_payload)
-            .is_ok()
-            .then_some(self)
+        let is_verified = if let Some(prepared_payload) = self.prepared_payload.as_deref() {
+            self.bls_pubkey
+                .verify_signature_prepared(&self.vote_message.signature, prepared_payload)
+                .is_ok()
+        } else {
+            let payload = wincode::serialize(&self.vote_message.vote).ok()?;
+            self.bls_pubkey
+                .verify_signature(&self.vote_message.signature, &payload)
+                .is_ok()
+        };
+        is_verified.then_some(self)
     }
 }
 
@@ -195,7 +193,7 @@ fn verify_votes(
     stats.too_far_in_future = stats.too_far_in_future.saturating_add(num_discarded as u64);
 
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
-    let (optimistic_verified, distinct_vote_count) =
+    let (optimistic_verified, distinct_votes, distinct_payloads) =
         verify_votes_optimistic(&votes_to_verify, stats, thread_pool);
     if optimistic_verified {
         return votes_to_verify;
@@ -204,7 +202,8 @@ fn verify_votes(
     // Fallback to individual verification
     let ((verified_votes, invalid_remote_pubkeys), time_us) = measure_us!(verify_individual_votes(
         votes_to_verify,
-        distinct_vote_count,
+        distinct_votes,
+        distinct_payloads,
         thread_pool,
     ));
     for remote_pubkey in invalid_remote_pubkeys {
@@ -220,7 +219,7 @@ fn verify_votes_optimistic(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
     thread_pool: &ThreadPool,
-) -> (bool, usize) {
+) -> (bool, Vec<Vote>, Vec<PreparedHashedMessage>) {
     let mut measure = Measure::start("verify_votes_optimistic");
 
     // For BLS verification, minimizing the expensive pairing operation is key.
@@ -232,19 +231,17 @@ fn verify_votes_optimistic(
     //
     // By verifying the aggregated signature against the aggregated public keys,
     // the number of pairings required is reduced to (1 + number of distinct messages).
-    let (signature_result, (distinct_payloads, pubkeys_result)) = thread_pool.join(
+    let (signature_result, (distinct_votes, distinct_payloads, pubkeys_result)) = thread_pool.join(
         || aggregate_signatures(votes),
         || aggregate_pubkeys_by_payload(votes, stats),
     );
 
     let Ok(aggregate_signature) = signature_result else {
-        return (false, 0);
+        return (false, Vec::new(), Vec::new());
     };
 
-    let distinct_vote_count = distinct_payloads.len();
-
     let Ok(aggregate_pubkeys) = pubkeys_result else {
-        return (false, distinct_vote_count);
+        return (false, distinct_votes, distinct_payloads);
     };
 
     let verified = if distinct_payloads.len() == 1 {
@@ -270,7 +267,7 @@ fn verify_votes_optimistic(
     stats
         .fn_verify_votes_optimistic_stats
         .add_sample(measure.as_us());
-    (verified, distinct_vote_count)
+    (verified, distinct_votes, distinct_payloads)
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -292,6 +289,7 @@ fn aggregate_pubkeys_by_payload(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
 ) -> (
+    Vec<Vote>,
     Vec<PreparedHashedMessage>,
     Result<Vec<PubkeyProjective>, BlsError>,
 ) {
@@ -309,20 +307,30 @@ fn aggregate_pubkeys_by_payload(
         .distinct_votes_stats
         .add_sample(grouped_votes.len() as u64);
 
-    let (distinct_payloads, distinct_pubkeys_results): (Vec<_>, Vec<_>) = grouped_votes
+    let distinct_grouped_votes = grouped_votes
         .into_par_iter()
         .filter_map(|(vote, pubkeys)| {
-            wincode::serialize(vote).ok().map(|vote| {
+            wincode::serialize(vote).ok().map(|serialized_vote| {
                 // TODO(sam): https://github.com/anza-xyz/alpenglow/issues/708
                 // should improve public key aggregation drastically (more than 80%)
                 let pubkey = PubkeyProjective::par_aggregate(pubkeys.into_par_iter());
-                (PreparedHashedMessage::new(&vote), pubkey)
+                (*vote, PreparedHashedMessage::new(&serialized_vote), pubkey)
             })
         })
-        .unzip();
+        .collect::<Vec<_>>();
+    let (distinct_votes, distinct_payloads, distinct_pubkeys_results): (Vec<_>, Vec<_>, Vec<_>) =
+        distinct_grouped_votes.into_iter().fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |mut acc, (vote, payload, pubkey)| {
+                acc.0.push(vote);
+                acc.1.push(payload);
+                acc.2.push(pubkey);
+                acc
+            },
+        );
     let aggregate_pubkeys_result = distinct_pubkeys_results.into_iter().collect();
 
-    (distinct_payloads, aggregate_pubkeys_result)
+    (distinct_votes, distinct_payloads, aggregate_pubkeys_result)
 }
 
 /// Verifies votes individually on a thread pool.
@@ -332,12 +340,20 @@ fn aggregate_pubkeys_by_payload(
 /// - `Vec<Pubkey>`: remote pubkeys for votes that failed verification.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn verify_individual_votes(
-    votes_to_verify: Vec<VotePayload>,
-    distinct_vote_count: usize,
+    mut votes_to_verify: Vec<VotePayload>,
+    distinct_votes: Vec<Vote>,
+    distinct_payloads: Vec<PreparedHashedMessage>,
     thread_pool: &ThreadPool,
 ) -> (Vec<VotePayload>, Vec<Pubkey>) {
-    if should_prepare_payload_cache(distinct_vote_count, votes_to_verify.len()) {
-        return verify_individual_votes_with_payload_cache(votes_to_verify, thread_pool);
+    if should_prepare_payload_cache(distinct_votes.len(), votes_to_verify.len()) {
+        let prepared_payloads: HashMap<_, _> = distinct_votes
+            .into_iter()
+            .zip(distinct_payloads)
+            .map(|(vote, payload)| (vote, Arc::new(payload)))
+            .collect();
+        for vote in &mut votes_to_verify {
+            vote.prepared_payload = prepared_payloads.get(&vote.vote_message.vote).cloned();
+        }
     }
 
     thread_pool.install(|| {
@@ -354,31 +370,6 @@ fn verify_individual_votes(
 fn should_prepare_payload_cache(distinct_vote_count: usize, total_vote_count: usize) -> bool {
     distinct_vote_count.saturating_mul(100)
         <= total_vote_count.saturating_mul(PREPARED_PAYLOAD_CACHE_DISTINCT_VOTE_THRESHOLD_PERCENT)
-}
-
-fn verify_individual_votes_with_payload_cache(
-    votes_to_verify: Vec<VotePayload>,
-    thread_pool: &ThreadPool,
-) -> (Vec<VotePayload>, Vec<Pubkey>) {
-    let mut prepared_payloads = HashMap::with_capacity(votes_to_verify.len());
-    for vote in &votes_to_verify {
-        let signed_vote = vote.vote_message.vote;
-        prepared_payloads.entry(signed_vote).or_insert_with(|| {
-            let payload = wincode::serialize(&signed_vote)
-                .expect("vote serialization should succeed for signature verification");
-            PreparedHashedMessage::new(&payload)
-        });
-    }
-
-    thread_pool.install(|| {
-        votes_to_verify.into_par_iter().partition_map(|vote| {
-            let remote_pubkey = vote.remote_pubkey;
-            match vote.verify_prepared(&prepared_payloads) {
-                Some(vote) => Either::Left(vote),
-                None => Either::Right(remote_pubkey),
-            }
-        })
-    })
 }
 
 #[cfg(test)]
@@ -410,6 +401,6 @@ mod tests {
         let votes = vec![];
         let mut stats = SigVerifyVoteStats::default();
         // calling without a rayon thread pool should trigger a debug assert.
-        aggregate_pubkeys_by_payload(&votes, &mut stats).1.unwrap();
+        aggregate_pubkeys_by_payload(&votes, &mut stats).2.unwrap();
     }
 }
