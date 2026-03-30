@@ -230,7 +230,7 @@ mod tests {
         rand::Rng,
         solana_gossip::{
             cluster_info::ClusterInfo, contact_info::ContactInfo, crds::GossipRoute,
-            crds_data::CrdsData, crds_value::CrdsValue,
+            crds_data::CrdsData, crds_value::CrdsValue, node::Node,
         },
         solana_keypair::Keypair,
         solana_net_utils::SocketAddrSpace,
@@ -343,7 +343,7 @@ mod tests {
         let bank_forks = BankForks::new_rw_arc(bank0);
 
         let mut cluster_info = ClusterInfo::new(
-            ContactInfo::new_localhost(&my_keypair.pubkey(), 0),
+            Node::new_localhost_with_pubkey(&my_keypair.pubkey()).info,
             Arc::new(my_keypair),
             SocketAddrSpace::Unspecified,
         );
