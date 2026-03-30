@@ -193,9 +193,9 @@ fn verify_votes(
     stats.too_far_in_future = stats.too_far_in_future.saturating_add(num_discarded as u64);
 
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
-    let (optimistic_verified, distinct_votes, distinct_payloads) =
+    let (optimistic_result, distinct_votes, distinct_payloads) =
         verify_votes_optimistic(&votes_to_verify, stats, thread_pool);
-    if optimistic_verified {
+    if matches!(optimistic_result, OptimisticVerificationResult::Verified) {
         return votes_to_verify;
     }
 
@@ -214,12 +214,27 @@ fn verify_votes(
     verified_votes
 }
 
+/// Outcome of optimistic aggregate vote verification.
+///
+/// `Failed` carries the number of distinct vote messages seen before falling
+/// back to individual verification.
+#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptimisticVerificationResult {
+    Verified,
+    Failed { num_distinct_messages: usize },
+}
+
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn verify_votes_optimistic(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
     thread_pool: &ThreadPool,
-) -> (bool, Vec<Vote>, Vec<PreparedHashedMessage>) {
+) -> (
+    OptimisticVerificationResult,
+    Vec<Vote>,
+    Vec<PreparedHashedMessage>,
+) {
     let mut measure = Measure::start("verify_votes_optimistic");
 
     // For BLS verification, minimizing the expensive pairing operation is key.
@@ -237,11 +252,23 @@ fn verify_votes_optimistic(
     );
 
     let Ok(aggregate_signature) = signature_result else {
-        return (false, Vec::new(), Vec::new());
+        return (
+            OptimisticVerificationResult::Failed {
+                num_distinct_messages: 0,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
     };
 
     let Ok(aggregate_pubkeys) = pubkeys_result else {
-        return (false, distinct_votes, distinct_payloads);
+        return (
+            OptimisticVerificationResult::Failed {
+                num_distinct_messages: distinct_payloads.len(),
+            },
+            distinct_votes,
+            distinct_payloads,
+        );
     };
 
     let verified = if distinct_payloads.len() == 1 {
@@ -267,7 +294,14 @@ fn verify_votes_optimistic(
     stats
         .fn_verify_votes_optimistic_stats
         .add_sample(measure.as_us());
-    (verified, distinct_votes, distinct_payloads)
+    let result = if verified {
+        OptimisticVerificationResult::Verified
+    } else {
+        OptimisticVerificationResult::Failed {
+            num_distinct_messages: distinct_payloads.len(),
+        }
+    };
+    (result, distinct_votes, distinct_payloads)
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
