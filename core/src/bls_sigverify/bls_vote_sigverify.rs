@@ -226,6 +226,17 @@ enum OptimisticVerificationResult {
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+/// Attempts aggregate BLS verification across the full vote set.
+///
+/// This fast path aggregates all vote signatures and the public keys for each
+/// distinct vote payload, minimizing the number of pairing operations needed
+/// for verification. When aggregation or aggregate verification fails, the
+/// caller falls back to individual vote verification so invalid votes can be
+/// identified precisely.
+///
+/// Returns the optimistic verification outcome together with the distinct vote
+/// messages and their prepared payloads, which can be reused by the fallback
+/// path.
 fn verify_votes_optimistic(
     votes: &[VotePayload],
     stats: &mut SigVerifyVoteStats,
