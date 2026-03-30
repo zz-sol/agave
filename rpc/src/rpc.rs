@@ -25,7 +25,7 @@ use {
     },
     solana_accounts_db::{
         accounts::AccountAddressFilter,
-        accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey, ScanConfig, ScanResult},
+        accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey, ScanResult},
     },
     solana_client::connection_cache::Protocol,
     solana_clock::{Slot, UnixTimestamp},
@@ -326,7 +326,6 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                     },
-                    &ScanConfig::default(),
                     bank.byte_limit_for_scans(),
                 )
             })
@@ -1044,7 +1043,6 @@ impl JsonRpcRequestProcessor {
     ) -> RpcCustomResult<RpcResponse<Vec<RpcAccountBalance>>> {
         let config = config.unwrap_or_default();
         let bank = self.bank(config.commitment);
-        let sort_results = config.sort_results.unwrap_or(true);
 
         if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
             Ok(RpcResponse {
@@ -1073,12 +1071,7 @@ impl JsonRpcRequestProcessor {
                 .spawn_blocking({
                     let bank = Arc::clone(&bank);
                     move || {
-                        bank.get_largest_accounts(
-                            NUM_LARGEST_ACCOUNTS,
-                            &addresses,
-                            address_filter,
-                            sort_results,
-                        )
+                        bank.get_largest_accounts(NUM_LARGEST_ACCOUNTS, &addresses, address_filter)
                     }
                 })
                 .await
@@ -1145,6 +1138,9 @@ impl JsonRpcRequestProcessor {
         };
 
         let bank = self.bank(config.commitment);
+        let commission_rate_in_basis_points = bank
+            .feature_set
+            .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
         let vote_accounts = bank.vote_accounts();
         let epoch_vote_accounts = bank
             .epoch_vote_accounts(bank.get_epoch_and_slot_index(bank.slot()).0)
@@ -1180,7 +1176,18 @@ impl JsonRpcRequestProcessor {
                     vote_pubkey: vote_pubkey.to_string(),
                     node_pubkey: vote_state_view.node_pubkey().to_string(),
                     activated_stake: *activated_stake,
-                    commission: vote_state_view.commission(),
+                    commission: if commission_rate_in_basis_points {
+                        // Derive percent from native bps, clamping to u8::MAX.
+                        let bps = vote_state_view.inflation_rewards_commission();
+                        bps.div_ceil(100).min(u8::MAX as u16) as u8
+                    } else {
+                        vote_state_view.commission()
+                    },
+                    inflation_rewards_commission_bps: Some(if commission_rate_in_basis_points {
+                        vote_state_view.inflation_rewards_commission()
+                    } else {
+                        vote_state_view.commission() as u16 * 100
+                    }),
                     root_slot: vote_state_view.root_slot().unwrap_or(0),
                     epoch_credits,
                     epoch_vote_account: epoch_vote_accounts.contains_key(vote_pubkey),
@@ -2262,7 +2269,6 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                         },
-                        &ScanConfig::default(),
                     )
                     .map_err(|e| RpcCustomError::ScanError {
                         message: e.to_string(),
@@ -2402,8 +2408,7 @@ impl JsonRpcRequestProcessor {
     fn get_stake_minimum_delegation(&self, config: RpcContextConfig) -> Result<RpcResponse<u64>> {
         let bank = self.get_bank_with_config(config)?;
         let stake_minimum_delegation = stake_utils::get_minimum_delegation(
-            bank.feature_set
-                .is_active(&agave_feature_set::upgrade_bpf_stake_program_to_v5::id()),
+            bank.feature_set.snapshot().upgrade_bpf_stake_program_to_v5,
         );
         Ok(new_response(&bank, stake_minimum_delegation))
     }
@@ -3863,7 +3868,8 @@ pub mod rpc_full {
                 preflight_bank.get_reserved_account_keys(),
                 preflight_bank
                     .feature_set
-                    .is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                    .snapshot()
+                    .limit_instruction_accounts,
             )?;
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
@@ -4025,8 +4031,7 @@ pub mod rpc_full {
                 unsanitized_tx,
                 bank,
                 bank.get_reserved_account_keys(),
-                bank.feature_set
-                    .is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                bank.feature_set.snapshot().limit_instruction_accounts,
             )?;
 
             let verification_error = if sig_verify {
@@ -9259,8 +9264,7 @@ pub mod tests {
         let rpc = RpcHandler::start();
         let bank = rpc.working_bank();
         let expected_stake_minimum_delegation = stake_utils::get_minimum_delegation(
-            bank.feature_set
-                .is_active(&agave_feature_set::upgrade_bpf_stake_program_to_v5::id()),
+            bank.feature_set.snapshot().upgrade_bpf_stake_program_to_v5,
         );
 
         let request = create_test_request("getStakeMinimumDelegation", None);

@@ -3555,7 +3555,11 @@ impl ReplayStage {
                 } else {
                     None
                 };
-                bank.set_block_id(block_id);
+
+                if block_id.is_some() {
+                    bank.set_block_id(block_id);
+                }
+
                 // Freeze the bank before sending to any auxiliary threads
                 // that may expect to be operating on a frozen bank
                 bank.freeze();
@@ -3730,9 +3734,8 @@ impl ReplayStage {
                         .parent()
                         .map(|bank| bank.last_blockhash())
                         .unwrap_or_default();
-                    let commission_rate_in_basis_points = bank
-                        .feature_set
-                        .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
+                    let commission_rate_in_basis_points =
+                        bank.feature_set.snapshot().commission_rate_in_basis_points;
                     block_metadata_notifier.notify_block_metadata(
                         bank.parent_slot(),
                         &parent_blockhash.to_string(),

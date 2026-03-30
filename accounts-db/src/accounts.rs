@@ -258,7 +258,6 @@ impl Accounts {
         num: usize,
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
-        _sort_results: bool, // can be removed, results are always sorted
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         if num == 0 {
             return Ok(vec![]);
@@ -319,7 +318,6 @@ impl Accounts {
         ancestors: &Ancestors,
         bank_id: BankId,
         program_id: &Pubkey,
-        config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
         self.accounts_db
@@ -331,7 +329,7 @@ impl Accounts {
                         account.owner() == program_id
                     })
                 },
-                config,
+                &ScanConfig::default(),
             )
             .map(|_| collector)
     }
@@ -342,7 +340,6 @@ impl Accounts {
         bank_id: BankId,
         program_id: &Pubkey,
         filter: F,
-        config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
         self.accounts_db
@@ -354,7 +351,7 @@ impl Accounts {
                         account.owner() == program_id && filter(account)
                     })
                 },
-                config,
+                &ScanConfig::default(),
             )
             .map(|_| collector)
     }
@@ -401,11 +398,10 @@ impl Accounts {
         bank_id: BankId,
         index_key: &IndexKey,
         filter: F,
-        config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let sum = AtomicUsize::default();
-        let config = config.recreate_with_abort();
+        let config = ScanConfig::default().recreate_with_abort();
         let mut collector = Vec::new();
         let result = self
             .accounts_db
@@ -1438,7 +1434,6 @@ mod tests {
                     0,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![]
@@ -1451,7 +1446,6 @@ mod tests {
                     0,
                     &all_pubkeys,
                     AccountAddressFilter::Include,
-                    false
                 )
                 .unwrap(),
             vec![]
@@ -1467,7 +1461,6 @@ mod tests {
                     1,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42)]
@@ -1480,7 +1473,6 @@ mod tests {
                     2,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42)]
@@ -1493,7 +1485,6 @@ mod tests {
                     3,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42), (pubkey2, 41)]
@@ -1508,7 +1499,6 @@ mod tests {
                     6,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42), (pubkey2, 41)]
@@ -1524,7 +1514,6 @@ mod tests {
                     1,
                     &exclude1,
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey0, 42)]
@@ -1537,7 +1526,6 @@ mod tests {
                     2,
                     &exclude1,
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey0, 42), (pubkey2, 41)]
@@ -1550,7 +1538,6 @@ mod tests {
                     3,
                     &exclude1,
                     AccountAddressFilter::Exclude,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey0, 42), (pubkey2, 41)]
@@ -1566,7 +1553,6 @@ mod tests {
                     1,
                     &include1_2,
                     AccountAddressFilter::Include,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42)]
@@ -1579,7 +1565,6 @@ mod tests {
                     2,
                     &include1_2,
                     AccountAddressFilter::Include,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey2, 41)]
@@ -1592,7 +1577,6 @@ mod tests {
                     3,
                     &include1_2,
                     AccountAddressFilter::Include,
-                    false
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey2, 41)]
