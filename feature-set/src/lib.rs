@@ -75,6 +75,7 @@ pub struct FeatureSnapshot {
     pub commission_rate_in_basis_points: bool,
     pub custom_commission_collector: bool,
     pub enable_bls12_381_syscall: bool,
+    pub secp256k1_use_k256: bool,
     pub set_lamports_per_byte_to_6333: bool,
     pub set_lamports_per_byte_to_5080: bool,
     pub set_lamports_per_byte_to_2575: bool,
@@ -188,6 +189,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             commission_rate_in_basis_points: is_active(&commission_rate_in_basis_points::ID),
             custom_commission_collector: is_active(&custom_commission_collector::ID),
             enable_bls12_381_syscall: is_active(&enable_bls12_381_syscall::ID),
+            secp256k1_use_k256: is_active(&secp256k1_use_k256::ID),
             set_lamports_per_byte_to_6333: is_active(&set_lamports_per_byte_to_6333::ID),
             set_lamports_per_byte_to_5080: is_active(&set_lamports_per_byte_to_5080::ID),
             set_lamports_per_byte_to_2575: is_active(&set_lamports_per_byte_to_2575::ID),
@@ -364,6 +366,7 @@ impl FeatureSet {
             commission_rate_in_basis_points: snapshot.commission_rate_in_basis_points,
             custom_commission_collector: snapshot.custom_commission_collector,
             enable_bls12_381_syscall: snapshot.enable_bls12_381_syscall,
+            secp256k1_use_k256: snapshot.secp256k1_use_k256,
             block_revenue_sharing: snapshot.block_revenue_sharing,
             vote_account_initialize_v2: snapshot.vote_account_initialize_v2,
             direct_account_pointers_in_program_input: snapshot
@@ -1521,7 +1524,7 @@ pub mod upgrade_bpf_stake_program_to_v5 {
     }
 }
 
-pub mod secp256k1_precompile_use_k256 {
+pub mod secp256k1_use_k256 {
     solana_pubkey::declare_id!("sk1BRtQU6D8GXphAqrQZnSJm3ajNVPPidY1NATASfwQ");
 }
 
@@ -2566,8 +2569,9 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0490: Upgrade BPF Stake Program to v5.0.0",
         ),
         (
-            secp256k1_precompile_use_k256::id(),
-            "Use k256 backend for secp256k1 precompile verification (NOTE: Agave only)",
+            secp256k1_use_k256::id(),
+            "Use k256 backend for secp256k1 recovery and precompile verification (NOTE: Agave \
+             only)",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

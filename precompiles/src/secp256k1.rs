@@ -1,5 +1,5 @@
 use {
-    agave_feature_set::{FeatureSet, secp256k1_precompile_use_k256},
+    agave_feature_set::{FeatureSet, secp256k1_use_k256},
     digest::Digest,
     k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
     solana_precompile_error::PrecompileError,
@@ -87,7 +87,7 @@ pub fn verify(
         hasher.update(message_slice);
         let message_hash: [u8; 32] = hasher.finalize().into();
 
-        let pubkey = if feature_set.is_active(&secp256k1_precompile_use_k256::id()) {
+        let pubkey = if feature_set.is_active(&secp256k1_use_k256::id()) {
             recover_pubkey_k256(&message_hash, recovery_id, signature)?
         } else {
             recover_pubkey_legacy(&message_hash, recovery_id, signature)?
