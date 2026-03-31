@@ -9511,6 +9511,7 @@ name = "solana-syscalls"
 version = "4.1.0-alpha.0"
 dependencies = [
  "bincode",
+ "k256",
  "libsecp256k1",
  "num-traits",
  "solana-account 4.1.0",
