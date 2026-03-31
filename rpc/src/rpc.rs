@@ -171,6 +171,8 @@ pub struct JsonRpcConfig {
     pub full_api: bool,
     pub rpc_scan_and_fix_roots: bool,
     pub max_request_body_size: Option<usize>,
+    /// If set, abort index scans whose accumulated results exceed this many bytes.
+    pub scan_results_limit_bytes: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
 }
@@ -192,6 +194,7 @@ impl Default for JsonRpcConfig {
             full_api: Default::default(),
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
+            scan_results_limit_bytes: Option::default(),
             disable_health_check: Default::default(),
         }
     }
@@ -310,6 +313,7 @@ impl JsonRpcRequestProcessor {
         let bank = Arc::clone(bank);
         let index_key = index_key.to_owned();
         let program_id = program_id.to_owned();
+        let byte_limit_for_scans = self.config.scan_results_limit_bytes;
         let mut accounts = self
             .runtime
             .spawn_blocking(move || {
@@ -326,7 +330,7 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                     },
-                    bank.byte_limit_for_scans(),
+                    byte_limit_for_scans,
                 )
             })
             .await
@@ -1138,6 +1142,9 @@ impl JsonRpcRequestProcessor {
         };
 
         let bank = self.bank(config.commitment);
+        let commission_rate_in_basis_points = bank
+            .feature_set
+            .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
         let vote_accounts = bank.vote_accounts();
         let epoch_vote_accounts = bank
             .epoch_vote_accounts(bank.get_epoch_and_slot_index(bank.slot()).0)
@@ -1173,7 +1180,18 @@ impl JsonRpcRequestProcessor {
                     vote_pubkey: vote_pubkey.to_string(),
                     node_pubkey: vote_state_view.node_pubkey().to_string(),
                     activated_stake: *activated_stake,
-                    commission: vote_state_view.commission(),
+                    commission: if commission_rate_in_basis_points {
+                        // Derive percent from native bps, clamping to u8::MAX.
+                        let bps = vote_state_view.inflation_rewards_commission();
+                        bps.div_ceil(100).min(u8::MAX as u16) as u8
+                    } else {
+                        vote_state_view.commission()
+                    },
+                    inflation_rewards_commission_bps: Some(if commission_rate_in_basis_points {
+                        vote_state_view.inflation_rewards_commission()
+                    } else {
+                        vote_state_view.commission() as u16 * 100
+                    }),
                     root_slot: vote_state_view.root_slot().unwrap_or(0),
                     epoch_credits,
                     epoch_vote_account: epoch_vote_accounts.contains_key(vote_pubkey),
