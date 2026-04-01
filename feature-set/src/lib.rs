@@ -2570,8 +2570,8 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         ),
         (
             secp256k1_use_k256::id(),
-            "Use k256 backend for secp256k1 recovery and precompile verification (NOTE: Agave \
-             only)",
+            "SIMD-0506: Use k256 backend for secp256k1 recovery and precompile verification \
+             (NOTE: Agave only)",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

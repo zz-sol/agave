@@ -34,11 +34,6 @@ solana-pubkey = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-secp256k1-program = { workspace = true, features = ["serde"] }
 solana-secp256k1-recover = { workspace = true }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
 solana-secp256r1-program = { workspace = true }
 
 [dev-dependencies]
