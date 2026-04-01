@@ -188,10 +188,10 @@ fn recover_secp256k1_pubkey_k256(
     let adjusted_recovery_id: u8 = recovery_id_val
         .try_into()
         .map_err(|_| Secp256k1RecoverError::InvalidRecoveryId)?;
-    let mut signature = k256::ecdsa::Signature::try_from(signature)
-        .map_err(|_| Secp256k1RecoverError::InvalidSignature)?;
     let mut recovery_id = k256::ecdsa::RecoveryId::try_from(adjusted_recovery_id)
         .map_err(|_| Secp256k1RecoverError::InvalidRecoveryId)?;
+    let mut signature = k256::ecdsa::Signature::try_from(signature)
+        .map_err(|_| Secp256k1RecoverError::InvalidSignature)?;
 
     if let Some(normalized_signature) = signature.normalize_s() {
         signature = normalized_signature;
@@ -3546,6 +3546,21 @@ mod tests {
         );
         assert_eq!(0, result.unwrap());
         assert_eq!(alt_recovered_pubkey, expected_pubkey);
+    }
+
+    #[test]
+    fn test_secp256k1_recover_with_k256_gate_preserves_invalid_recovery_id_priority() {
+        let hash = [7u8; HASH_BYTES];
+        let invalid_signature = [0u8; SECP256K1_SIGNATURE_LENGTH];
+
+        assert_eq!(
+            recover_secp256k1_pubkey_legacy(&hash, 4, &invalid_signature),
+            Err(Secp256k1RecoverError::InvalidRecoveryId)
+        );
+        assert_eq!(
+            recover_secp256k1_pubkey_k256(&hash, 4, &invalid_signature),
+            Err(Secp256k1RecoverError::InvalidRecoveryId)
+        );
     }
 
     #[test]
