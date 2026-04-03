@@ -1,12 +1,12 @@
 use {
     agave_feature_set::{FeatureSet, secp256k1_use_k256},
     k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
+    solana_keccak_hasher as keccak,
     solana_precompile_error::PrecompileError,
     solana_secp256k1_program::{
         HASHED_PUBKEY_SERIALIZED_SIZE, SIGNATURE_OFFSETS_SERIALIZED_SIZE,
         SIGNATURE_SERIALIZED_SIZE, SecpSignatureOffsets, eth_address_from_pubkey,
     },
-    solana_keccak_hasher as keccak,
 };
 
 /// Verifies the signatures specified in the secp256k1 instruction data.

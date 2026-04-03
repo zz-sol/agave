@@ -10552,6 +10552,7 @@ dependencies = [
  "solana-sbpf",
  "solana-sdk-ids",
  "solana-secp256k1-program",
+ "solana-secp256r1-program",
  "solana-signature",
  "solana-signer",
  "solana-svm",
