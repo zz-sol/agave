@@ -203,7 +203,6 @@ dependencies = [
  "agave-precompiles",
  "bincode",
  "bytemuck",
- "digest 0.10.7",
  "ed25519-dalek 1.0.1",
  "hex",
  "k256",
