@@ -1,7 +1,6 @@
 use {
     agave_feature_set::{FeatureSet, secp256k1_use_k256},
     k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
-    solana_keccak_hasher as keccak,
     solana_precompile_error::PrecompileError,
     solana_secp256k1_program::{
         HASHED_PUBKEY_SERIALIZED_SIZE, SIGNATURE_OFFSETS_SERIALIZED_SIZE,
@@ -84,7 +83,7 @@ pub fn verify(
         )?;
 
         let message_hash = {
-            let mut hasher = keccak::Hasher::default();
+            let mut hasher = solana_keccak_hasher::Hasher::default();
             hasher.hash(message_slice);
             hasher.result()
         };
