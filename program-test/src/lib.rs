@@ -16,6 +16,7 @@ use {
     },
     solana_account_info::AccountInfo,
     solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    solana_address::Address,
     solana_banks_client::start_client,
     solana_banks_server::banks_server::start_local_server,
     solana_clock::{Clock, Epoch, Slot},
@@ -37,7 +38,7 @@ use {
     solana_program_entrypoint::{SUCCESS, deserialize},
     solana_program_error::{ProgramError, ProgramResult},
     solana_program_runtime::{
-        invoke_context::BuiltinFunctionRegisterer, loaded_programs::ProgramCacheEntry,
+        invoke_context::BuiltinFunctionRegisterer, program_cache_entry::ProgramCacheEntry,
         serialization::serialize_parameters, stable_log, sysvar_cache::SysvarCache,
     },
     solana_pubkey::Pubkey,
@@ -82,7 +83,7 @@ pub use {
         error::EbpfError,
         memory_region::MemoryMapping,
         program::BuiltinFunctionDefinition,
-        vm::{EbpfVm, get_runtime_environment_key},
+        vm::{EbpfVm, EncryptedHostAddressToEbpfVm, get_runtime_environment_key},
     },
     solana_transaction_context::IndexOfAccount,
 };
@@ -227,22 +228,23 @@ macro_rules! processor {
                 unreachable!()
             }
             fn vm(
-                vm: *mut $crate::EbpfVm<$crate::InvokeContext>,
+                mut vm: $crate::EncryptedHostAddressToEbpfVm<$crate::InvokeContext>,
                 _: u64,
                 _: u64,
                 _: u64,
                 _: u64,
                 _: u64,
             ) {
-                let vm = unsafe {
-                    &mut *((vm as *mut u64)
-                        .offset(-($crate::get_runtime_environment_key() as isize))
-                        as *mut $crate::EbpfVm<$crate::InvokeContext>)
-                };
-                vm.program_result =
-                    $crate::invoke_builtin_function($builtin_function, vm.context_object_pointer)
+                unsafe {
+                    vm.with_vm(|vm| {
+                        vm.program_result = $crate::invoke_builtin_function(
+                            $builtin_function,
+                            vm.context_object_pointer.as_mut(),
+                        )
                         .map_err(|err| $crate::EbpfError::SyscallError(err))
                         .into();
+                    });
+                }
             }
         };
         Some(<Converter as $crate::BuiltinFunctionDefinition<_>>::register)
@@ -1022,17 +1024,21 @@ impl ProgramTest {
             bank.store_account(address, account);
         }
         bank.set_capitalization_for_tests(bank.calculate_capitalization_for_tests());
-        // Advance beyond slot 0 for a slightly more realistic test environment
-        let bank = {
-            let bank = Arc::new(bank);
-            bank.fill_bank_with_ticks_for_tests();
-            let bank = Bank::new_from_parent(bank.clone(), *bank.leader(), bank.slot() + 1);
-            debug!("Bank slot: {}", bank.slot());
-            bank
-        };
-        let slot = bank.slot();
-        let last_blockhash = bank.last_blockhash();
+        // Advance beyond slot 0 for a slightly more realistic test environment.
+        // Create BankForks from the genesis bank first so fork_graph is set before creating
+        // the child bank (required for ProgramCache::extract in new_from_parent).
+        bank.fill_bank_with_ticks_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
+        let bank0 = bank_forks.read().unwrap().root_bank();
+        let bank1 = Bank::new_from_parent(bank0.clone(), *bank0.leader(), bank0.slot() + 1);
+        let bank1 = {
+            let mut bf = bank_forks.write().unwrap();
+            bf.insert(bank1);
+            bf.working_bank()
+        };
+        debug!("Bank slot: {}", bank1.slot());
+        let slot = bank1.slot();
+        let last_blockhash = bank1.last_blockhash();
         let block_commitment_cache = Arc::new(RwLock::new(
             BlockCommitmentCache::new_for_tests_with_slots(slot, slot),
         ));
@@ -1216,6 +1222,15 @@ impl ProgramTestContext {
         &self.genesis_config
     }
 
+    pub fn is_active(&self, feature: &Address) -> bool {
+        self.bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .feature_set
+            .is_active(feature)
+    }
+
     /// Manually increment vote credits for the current epoch in the specified vote account to simulate validator voting activity
     pub fn increment_vote_account_credits(
         &mut self,
@@ -1298,8 +1313,7 @@ impl ProgramTestContext {
 
     /// Force the working bank ahead to a new slot
     pub fn warp_to_slot(&mut self, warp_slot: Slot) -> Result<(), ProgramTestError> {
-        let mut bank_forks = self.bank_forks.write().unwrap();
-        let bank = bank_forks.working_bank();
+        let bank = self.bank_forks.read().unwrap().working_bank();
 
         // Fill ticks until a new blockhash is recorded, otherwise retried transactions will have
         // the same signature
@@ -1319,27 +1333,23 @@ impl ProgramTestContext {
             bank.freeze();
             bank
         } else {
-            bank_forks
-                .insert(Bank::warp_from_parent(
-                    bank,
-                    SlotLeader::default(),
-                    pre_warp_slot,
-                ))
+            let warped = Bank::warp_from_parent(bank, SlotLeader::default(), pre_warp_slot);
+            self.bank_forks
+                .write()
+                .unwrap()
+                .insert(warped)
                 .clone_without_scheduler()
         };
 
-        bank_forks.set_root(
+        self.bank_forks.write().unwrap().set_root(
             pre_warp_slot,
             None, // snapshots are disabled
             Some(pre_warp_slot),
         );
 
         // warp_bank is frozen so go forward to get unfrozen bank at warp_slot
-        bank_forks.insert(Bank::new_from_parent(
-            warp_bank,
-            SlotLeader::default(),
-            warp_slot,
-        ));
+        let bank_at_warp_slot = Bank::new_from_parent(warp_bank, SlotLeader::default(), warp_slot);
+        self.bank_forks.write().unwrap().insert(bank_at_warp_slot);
 
         // Update block commitment cache, otherwise banks server will poll at
         // the wrong slot
@@ -1350,7 +1360,7 @@ impl ProgramTestContext {
         // bank.
         w_block_commitment_cache.set_all_slots(warp_slot, warp_slot);
 
-        let bank = bank_forks.working_bank();
+        let bank = self.bank_forks.read().unwrap().working_bank();
         self.last_blockhash = bank.last_blockhash();
         Ok(())
     }
@@ -1365,15 +1375,14 @@ impl ProgramTestContext {
 
     /// warp forward one more slot and force reward interval end
     pub fn warp_forward_force_reward_interval_end(&mut self) -> Result<(), ProgramTestError> {
-        let mut bank_forks = self.bank_forks.write().unwrap();
-        let bank = bank_forks.working_bank();
+        let bank = self.bank_forks.read().unwrap().working_bank();
 
         // Fill ticks until a new blockhash is recorded, otherwise retried transactions will have
         // the same signature
         bank.fill_bank_with_ticks_for_tests();
         let pre_warp_slot = bank.slot();
 
-        bank_forks.set_root(
+        self.bank_forks.write().unwrap().set_root(
             pre_warp_slot,
             None, // snapshot_controller
             Some(pre_warp_slot),
@@ -1384,7 +1393,7 @@ impl ProgramTestContext {
         let mut warp_bank = Bank::new_from_parent(bank, SlotLeader::default(), warp_slot);
 
         warp_bank.force_reward_interval_end_for_tests();
-        bank_forks.insert(warp_bank);
+        self.bank_forks.write().unwrap().insert(warp_bank);
 
         // Update block commitment cache, otherwise banks server will poll at
         // the wrong slot
@@ -1395,7 +1404,7 @@ impl ProgramTestContext {
         // bank.
         w_block_commitment_cache.set_all_slots(warp_slot, warp_slot);
 
-        let bank = bank_forks.working_bank();
+        let bank = self.bank_forks.read().unwrap().working_bank();
         self.last_blockhash = bank.last_blockhash();
         Ok(())
     }

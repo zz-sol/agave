@@ -231,7 +231,7 @@ pub(crate) mod external {
     pub(crate) struct ExternalWorker {
         exit: Arc<AtomicBool>,
         consumer: Consumer,
-        sender: shaq::Producer<WorkerToPackMessage>,
+        sender: shaq::spsc::Producer<WorkerToPackMessage>,
         allocator: rts_alloc::Allocator,
 
         shared_leader_state: SharedLeaderState,
@@ -247,7 +247,7 @@ pub(crate) mod external {
             id: u32,
             exit: Arc<AtomicBool>,
             consumer: Consumer,
-            sender: shaq::Producer<WorkerToPackMessage>,
+            sender: shaq::spsc::Producer<WorkerToPackMessage>,
             allocator: rts_alloc::Allocator,
             shared_leader_state: SharedLeaderState,
             sharable_banks: SharableBanks,
@@ -269,7 +269,7 @@ pub(crate) mod external {
 
         pub fn run(
             mut self,
-            mut receiver: shaq::Consumer<PackToWorkerMessage>,
+            mut receiver: shaq::spsc::Consumer<PackToWorkerMessage>,
         ) -> Result<(), ExternalConsumeWorkerError> {
             let mut should_drain_executes = false;
             let mut did_work = false;
@@ -757,9 +757,8 @@ pub(crate) mod external {
             Vec<TxView>,
             &'a mut [CheckResponse],
         ) {
-            let enable_instruction_accounts_limit = bank
-                .feature_set
-                .is_active(&agave_feature_set::limit_instruction_accounts::ID);
+            let enable_instruction_accounts_limit =
+                bank.feature_set.snapshot().limit_instruction_accounts;
             let mut parsing_results = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut parsed_transactions = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             for (tx_ptr, _) in batch.iter() {
@@ -946,9 +945,8 @@ pub(crate) mod external {
             batch: &TransactionPtrBatch,
             bank: &Bank,
         ) -> (Vec<Result<(), PacketHandlingError>>, Vec<Tx>, Vec<MaxAge>) {
-            let enable_instruction_accounts_limit = bank
-                .feature_set
-                .is_active(&agave_feature_set::limit_instruction_accounts::ID);
+            let enable_instruction_accounts_limit =
+                bank.feature_set.snapshot().limit_instruction_accounts;
             let transaction_account_lock_limit = bank.get_transaction_account_lock_limit();
 
             let mut translation_results = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
@@ -1619,8 +1617,6 @@ impl ConsumeWorkerMetrics {
             retryable_transaction_indexes,
             execute_and_commit_timings,
             error_counters,
-            min_prioritization_fees,
-            max_prioritization_fees,
             ..
         }: &ExecuteAndCommitTransactionsOutput,
     ) {
@@ -1642,20 +1638,6 @@ impl ConsumeWorkerMetrics {
         self.count_metrics
             .retryable_transaction_count
             .fetch_add(retryable_transaction_indexes.len(), Ordering::Relaxed);
-        let min_prioritization_fees = self
-            .count_metrics
-            .min_prioritization_fees
-            .fetch_min(*min_prioritization_fees, Ordering::Relaxed);
-        let max_prioritization_fees = self
-            .count_metrics
-            .max_prioritization_fees
-            .fetch_max(*max_prioritization_fees, Ordering::Relaxed);
-        self.count_metrics
-            .min_prioritization_fees
-            .swap(min_prioritization_fees, Ordering::Relaxed);
-        self.count_metrics
-            .max_prioritization_fees
-            .swap(max_prioritization_fees, Ordering::Relaxed);
         self.update_on_execute_and_commit_timings(execute_and_commit_timings);
         self.update_on_error_counters(error_counters);
     }
@@ -1804,6 +1786,7 @@ impl ConsumeWorkerMetrics {
     }
 }
 
+#[derive(Default)]
 struct ConsumeWorkerCountMetrics {
     max_queue_len: AtomicU64,
     num_messages_processed: AtomicU64,
@@ -1813,25 +1796,6 @@ struct ConsumeWorkerCountMetrics {
     retryable_transaction_count: AtomicUsize,
     retryable_expired_bank_count: AtomicUsize,
     cost_model_throttled_transactions_count: AtomicU64,
-    min_prioritization_fees: AtomicU64,
-    max_prioritization_fees: AtomicU64,
-}
-
-impl Default for ConsumeWorkerCountMetrics {
-    fn default() -> Self {
-        Self {
-            max_queue_len: AtomicU64::default(),
-            num_messages_processed: AtomicU64::default(),
-            transactions_attempted_processing_count: AtomicU64::default(),
-            processed_transactions_count: AtomicU64::default(),
-            processed_with_successful_result_count: AtomicU64::default(),
-            retryable_transaction_count: AtomicUsize::default(),
-            retryable_expired_bank_count: AtomicUsize::default(),
-            cost_model_throttled_transactions_count: AtomicU64::default(),
-            min_prioritization_fees: AtomicU64::new(u64::MAX),
-            max_prioritization_fees: AtomicU64::default(),
-        }
-    }
 }
 
 impl ConsumeWorkerCountMetrics {
@@ -1876,17 +1840,6 @@ impl ConsumeWorkerCountMetrics {
                 "cost_model_throttled_transactions_count",
                 self.cost_model_throttled_transactions_count
                     .swap(0, Ordering::Relaxed),
-                i64
-            ),
-            (
-                "min_prioritization_fees",
-                self.min_prioritization_fees
-                    .swap(u64::MAX, Ordering::Relaxed),
-                i64
-            ),
-            (
-                "max_prioritization_fees",
-                self.max_prioritization_fees.swap(0, Ordering::Relaxed),
                 i64
             ),
         );
@@ -2582,8 +2535,7 @@ mod tests {
                 None,
                 loader,
                 &HashSet::default(),
-                bank.feature_set
-                    .is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                bank.feature_set.snapshot().limit_instruction_accounts,
             )
             .unwrap()
         };
