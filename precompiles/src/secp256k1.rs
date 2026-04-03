@@ -1,12 +1,12 @@
 use {
     agave_feature_set::{FeatureSet, secp256k1_use_k256},
-    digest::Digest,
     k256::ecdsa::{RecoveryId, Signature, VerifyingKey},
     solana_precompile_error::PrecompileError,
     solana_secp256k1_program::{
         HASHED_PUBKEY_SERIALIZED_SIZE, SIGNATURE_OFFSETS_SERIALIZED_SIZE,
         SIGNATURE_SERIALIZED_SIZE, SecpSignatureOffsets, eth_address_from_pubkey,
     },
+    solana_keccak_hasher as keccak,
 };
 
 /// Verifies the signatures specified in the secp256k1 instruction data.
@@ -83,14 +83,16 @@ pub fn verify(
             offsets.message_data_size as usize,
         )?;
 
-        let mut hasher = sha3::Keccak256::new();
-        hasher.update(message_slice);
-        let message_hash: [u8; 32] = hasher.finalize().into();
+        let message_hash = {
+            let mut hasher = keccak::Hasher::default();
+            hasher.hash(message_slice);
+            hasher.result()
+        };
 
         let pubkey = if feature_set.is_active(&secp256k1_use_k256::id()) {
-            recover_pubkey_k256(&message_hash, recovery_id, signature)?
+            recover_pubkey_k256(message_hash.as_bytes(), recovery_id, signature)?
         } else {
-            recover_pubkey_legacy(&message_hash, recovery_id, signature)?
+            recover_pubkey_legacy(message_hash.as_bytes(), recovery_id, signature)?
         };
         let eth_address = eth_address_from_pubkey(&pubkey);
 
